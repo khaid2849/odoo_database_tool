@@ -15,7 +15,8 @@ from odoo_database_tool.jobs import JobContext, JobError
 from odoo_database_tool.models import Connection, Kind, SshTarget
 from odoo_database_tool.restore import (Activity, DumpInfo, RestoreJob, RestorePlan,
                                         count_restore_errors, filter_column_options,
-                                        find_psql_meta_command, inspect_dump)
+                                        find_psql_meta_command, inspect_dump,
+                                        psql_supports_restrict)
 from odoo_database_tool.runner import CancelToken, Redactor, RunResult
 from odoo_database_tool.store import Secrets
 from odoo_database_tool.tools import ToolInfo
@@ -45,6 +46,9 @@ PRE_DATA = (
     "ALTER TABLE ONLY public.res_users ALTER COLUMN login SET (n_distinct=-1);\n"
 )
 PG_ATTVER_LINE = "ALTER TABLE ONLY public.res_users ALTER COLUMN id SET (pg_attver=27258152);\n"
+# What pg_restore 17.6+ writes for a dump that needs the rewrite, and the script psql then runs.
+REWRITE = "\\restrict k3Y\n" + PRE_DATA + PG_ATTVER_LINE + "\\unrestrict k3Y\n"
+REWRITTEN = 'SET ROLE "odoo";\n\\restrict k3Y\n' + PRE_DATA + "\\unrestrict k3Y\n"
 
 
 def file_arg(cmd):
@@ -60,8 +64,11 @@ def writes_script(text):
 
 
 class FakeSettings:
+    def __init__(self, psql="18.6"):
+        self.psql = psql
+
     def tool(self, name):
-        return ToolInfo(name, f"/pg/bin/{name}", "17.2")
+        return ToolInfo(name, f"/pg/bin/{name}", self.psql if name == "psql" else "17.2")
 
 
 class FakeCapture:
@@ -197,9 +204,9 @@ def dump_file(tmp_path):
     return p
 
 
-def make_job(secrets, ctx, capture=None, run=None, events=None):
+def make_job(secrets, ctx, capture=None, run=None, events=None, settings=None):
     events = [] if events is None else events
-    settings = FakeSettings()
+    settings = settings or FakeSettings()
     capture = capture or FakeCapture(events)
     run = run or FakeRun(events)
     job = RestoreJob(CommandBuilder(settings, secrets, "ssh"), settings, ctx,
@@ -382,7 +389,7 @@ def test_execute_happy_path_order(secrets, ctx, local_conn, dump_file):
     outcome = job.execute(make_plan(dump_file, local_conn))
     steps = [s for s in tool_order(events) if s != "psql"]  # drop the read-only queries
     assert steps == ["pg_restore pre-data", "dropdb", "createdb", "psql CREATE EXTENSION vector",
-                     "psql script", "pg_restore", "vacuumdb"]
+                     "pg_restore", "vacuumdb"]
     # the schema script is extracted first, so the connections check stays next to dropdb
     assert tool_order(events)[:2] == ["pg_restore pre-data", "psql"]
     assert "pg_stat_activity" in events[1]
@@ -391,12 +398,9 @@ def test_execute_happy_path_order(secrets, ctx, local_conn, dump_file):
     pre = cap.called("--section=pre-data")[0]
     assert pre.startswith("/pg/bin/pg_restore --section=pre-data --no-owner --no-privileges -f ")
     assert pre.endswith(f" {dump_file}") and " -d " not in pre
-    schema = run.called("ON_ERROR_STOP=0")[0]
-    assert "-X -b -v ON_ERROR_STOP=0 -d mydb -f " in schema
-    assert "--single-transaction" not in schema
-    restore = run.called("--section=data")[0]
-    assert (f"--section=data --section=post-data --no-owner --no-privileges --role=odoo "
-            f"-j 4 -d mydb {dump_file}") in restore
+    restore = run.called("pg_restore")[0]
+    assert restore.endswith(f" -w --no-owner --no-privileges --role=odoo -j 4 -d mydb {dump_file}")
+    assert not run.called("ON_ERROR_STOP=0") and "--section" not in restore
     assert outcome.status == "ok" and outcome.errors == 0
     assert outcome.log_path.parent == dump_file.parent
     assert re.fullmatch(r"restore_mydb_\d{8}-\d{4}\.log", outcome.log_path.name)
@@ -417,8 +421,8 @@ def test_new_db_skips_drop(secrets, ctx, local_conn, dump_file):
 def test_cancel_only_reaches_pg_restore(secrets, ctx, local_conn, dump_file):
     job, _, run, _ = make_job(secrets, ctx)
     job.execute(make_plan(dump_file, local_conn))
-    assert run.cancel_passed == {"dropdb": False, "createdb": False, "ON_ERROR_STOP=0": True,
-                                 "pg_restore": True, "vacuumdb": False}
+    assert run.cancel_passed == {"dropdb": False, "createdb": False, "pg_restore": True,
+                                 "vacuumdb": False}
 
 
 def test_cancel_before_drop_touches_nothing(secrets, ctx, local_conn, dump_file):
@@ -932,12 +936,12 @@ def test_filter_never_drops_lines_it_cannot_parse():
 def test_schema_script_is_filtered_and_runs_as_owner(secrets, ctx, local_conn, dump_file):
     events = []
     cap = FakeCapture(events, **{"--section=pre-data": writes_script(
-        PRE_DATA + PG_ATTVER_LINE + PG_ATTVER_LINE.replace("COLUMN id", "COLUMN login"))})
+        REWRITE + PG_ATTVER_LINE.replace("COLUMN id", "COLUMN login"))})
     job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
     outcome = job.execute(make_plan(dump_file, local_conn))
     assert outcome.status == "ok"
     [(path, script)] = run.scripts_seen.items()
-    assert script == 'SET ROLE "odoo";\n' + PRE_DATA
+    assert script == REWRITTEN
     assert ("Skipped 2 column option(s) not supported by the target server: pg_attver (2)."
             in outcome.warnings)
     assert not path.exists() and not path.parent.exists()  # temp script cleaned up
@@ -970,6 +974,10 @@ def test_cancel_before_drop_cleans_the_schema_script(secrets, ctx, local_conn, d
     assert not file_arg_from(cap.called("--section=pre-data")[0]).parent.exists()
 
 
+def rewrite_capture(events, text=REWRITE):
+    return FakeCapture(events, **{"--section=pre-data": writes_script(text)})
+
+
 def test_psql_and_pg_restore_errors_share_the_log(secrets, ctx, local_conn, dump_file):
     events = []
     run = FakeRun(events, **{
@@ -977,7 +985,7 @@ def test_psql_and_pg_restore_errors_share_the_log(secrets, ctx, local_conn, dump
                                 '"other"', "LINE 1: ALTER TABLE ..."], False, ""),
         "pg_restore": (1, ["pg_restore: error: COPY failed for table \"t\"",
                            "pg_restore: warning: errors ignored on restore: 1"], False, "")})
-    job, _, _, _ = make_job(secrets, ctx, run=run, events=events)
+    job, _, _, _ = make_job(secrets, ctx, capture=rewrite_capture(events), run=run, events=events)
     outcome = job.execute(make_plan(dump_file, local_conn))
     assert outcome.status == "ok" and outcome.errors == 2
     text = outcome.log_path.read_text()
@@ -997,7 +1005,8 @@ def test_psql_and_pg_restore_errors_share_the_log(secrets, ctx, local_conn, dump
 def test_schema_step_failure_is_partial(secrets, ctx, local_conn, dump_file, script, reason):
     events = []
     run = FakeRun(events, **{"ON_ERROR_STOP=0": script})
-    job, cap, _, _ = make_job(secrets, ctx, run=run, events=events)
+    cap = rewrite_capture(events)
+    job, _, _, _ = make_job(secrets, ctx, capture=cap, run=run, events=events)
     outcome = job.execute(make_plan(dump_file, local_conn))
     assert outcome.status == "partial"
     assert not run.called("--section=data") and not run.called("vacuumdb")
@@ -1012,7 +1021,7 @@ def test_ignored_line_from_psql_does_not_excuse_a_fatal_pg_restore(secrets, ctx,
     run = FakeRun(events, **{
         "ON_ERROR_STOP=0": (0, ["pg_restore: warning: errors ignored on restore: 1"], False, ""),
         "pg_restore": (1, ["pg_restore: error: connection lost"], False, "")})
-    job, _, _, _ = make_job(secrets, ctx, run=run, events=events)
+    job, _, _, _ = make_job(secrets, ctx, capture=rewrite_capture(events), run=run, events=events)
     outcome = job.execute(make_plan(dump_file, local_conn))
     assert outcome.status == "partial"
     assert any("pg_restore stopped with exit code 1" in w for w in outcome.warnings)
@@ -1103,13 +1112,13 @@ def test_find_psql_meta_command():
 def test_meta_command_in_schema_refuses_before_anything(secrets, ctx, local_conn, dump_file,
                                                         bad):
     events = []
-    cap = FakeCapture(events, **{"--section=pre-data": writes_script(
-        "-- Name: evil\n" + bad + PRE_DATA)})
+    evil = "-- Name: evil\n" + bad + "SET statement_timeout"
+    cap = rewrite_capture(events, REWRITE.replace("SET statement_timeout", evil))
     job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
     with pytest.raises(JobError) as exc:
         job.execute(make_plan(dump_file, local_conn))
-    # line 1 is the prepended SET ROLE, line 2 the comment
-    assert str(exc.value) == ("The schema script contains psql meta-commands (line 3); refusing "
+    # line 1 is the prepended SET ROLE, 2 \restrict, 3 the comment
+    assert str(exc.value) == ("The schema script contains psql meta-commands (line 4); refusing "
                               "to run it. Nothing was changed.")
     assert run.calls == [] and not cap.called("pg_stat_activity")
     assert not list(dump_file.parent.glob("restore_*.log"))
@@ -1118,16 +1127,102 @@ def test_meta_command_in_schema_refuses_before_anything(secrets, ctx, local_conn
 
 def test_restrict_meta_commands_are_allowed(secrets, ctx, local_conn, dump_file):
     events = []
-    body = "\\restrict k3Y\n" + PRE_DATA + "\\unrestrict k3Y\n"
-    cap = FakeCapture(events, **{"--section=pre-data": writes_script(body)})
-    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    job, _, run, _ = make_job(secrets, ctx, capture=rewrite_capture(events), events=events)
     outcome = job.execute(make_plan(dump_file, local_conn))
     assert outcome.status == "ok"
-    assert list(run.scripts_seen.values()) == ['SET ROLE "odoo";\n' + body]
+    assert list(run.scripts_seen.values()) == [REWRITTEN]
 
 
 def test_log_notes_the_line_offset(secrets, ctx, local_conn, dump_file):
-    job, _, _, _ = make_job(secrets, ctx)
+    events = []
+    job, _, _, _ = make_job(secrets, ctx, capture=rewrite_capture(events), events=events)
     outcome = job.execute(make_plan(dump_file, local_conn))
     first = outcome.log_path.read_text().splitlines()[0]
     assert first == "Schema script line numbers are +1 (SET ROLE prepended)"
+
+
+def test_plain_restore_log_has_no_offset_note(secrets, ctx, local_conn, dump_file):
+    job, _, _, _ = make_job(secrets, ctx)
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    assert "SET ROLE prepended" not in outcome.log_path.read_text()
+
+
+# --- the psql path only when needed, and only with the \restrict safeguard -----------------
+
+@pytest.mark.parametrize("version, ok", [
+    ("12.22", False), ("13.21", False), ("13.22", True), ("14.18", False), ("14.19", True),
+    ("15.13", False), ("15.14", True), ("16.9", False), ("16.10", True), ("17.5", False),
+    ("17.6", True), ("17.12 (Homebrew)", True), ("18.0", True), ("18beta1", True),
+    ("19devel", True), ("9.6.24", False), ("", False),
+])
+def test_psql_supports_restrict(version, ok):
+    assert psql_supports_restrict(version) is ok
+
+
+def test_dump_without_unknown_options_keeps_the_single_pg_restore(secrets, ctx, local_conn,
+                                                                  dump_file):
+    events = []
+    job, cap, run, _ = make_job(secrets, ctx, events=events, settings=FakeSettings(psql="12.4"))
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    assert outcome.status == "ok"
+    assert [s for s in tool_order(events) if s != "psql"] == [
+        "pg_restore pre-data", "dropdb", "createdb", "psql CREATE EXTENSION vector",
+        "pg_restore", "vacuumdb"]
+    assert not run.called("ON_ERROR_STOP=0") and run.scripts_seen == {}
+    assert not any("column option" in w for w in outcome.warnings)
+
+
+def test_meta_command_does_not_block_a_plain_restore(secrets, ctx, local_conn, dump_file):
+    events = []
+    cap = rewrite_capture(events, "\\! echo not run by psql\n" + PRE_DATA)
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    assert job.execute(make_plan(dump_file, local_conn)).status == "ok"
+    assert not run.called("ON_ERROR_STOP=0")
+
+
+def test_unknown_options_use_the_psql_path(secrets, ctx, local_conn, dump_file):
+    events = []
+    job, cap, run, _ = make_job(secrets, ctx, capture=rewrite_capture(events), events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    assert outcome.status == "ok"
+    assert [s for s in tool_order(events) if s != "psql"] == [
+        "pg_restore pre-data", "dropdb", "createdb", "psql CREATE EXTENSION vector",
+        "psql script", "pg_restore", "vacuumdb"]
+    schema = run.called("ON_ERROR_STOP=0")[0]
+    assert "-X -b -v ON_ERROR_STOP=0 -d mydb -f " in schema
+    assert "--single-transaction" not in schema
+    restore = run.called("pg_restore")[0]
+    assert (f"--section=data --section=post-data --no-owner --no-privileges --role=odoo "
+            f"-j 4 -d mydb {dump_file}") in restore
+    assert run.cancel_passed == {"dropdb": False, "createdb": False, "ON_ERROR_STOP=0": True,
+                                 "pg_restore": True, "vacuumdb": False}
+    assert ("Skipped 1 column option(s) not supported by the target server: pg_attver (1)."
+            in outcome.warnings)
+
+
+def test_rewrite_without_restrict_refuses_before_drop(secrets, ctx, local_conn, dump_file):
+    events = []
+    cap = rewrite_capture(events, PRE_DATA + PG_ATTVER_LINE)
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    with pytest.raises(JobError) as exc:
+        job.execute(make_plan(dump_file, local_conn))
+    assert str(exc.value) == (
+        "This dump needs a schema rewrite (unsupported column options: pg_attver), which "
+        "requires PostgreSQL client tools with the \\restrict safeguard (17.6+, 16.10+, 15.14+, "
+        "14.19+, 13.22+ or 18+). Update pg_restore and psql, then retry. Nothing was changed.")
+    assert run.calls == [] and not cap.called("pg_stat_activity")
+    assert not list(dump_file.parent.glob("restore_*.log"))
+
+
+def test_rewrite_with_old_psql_refuses_before_drop(secrets, ctx, local_conn, dump_file):
+    events = []
+    cap = rewrite_capture(events)
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events,
+                              settings=FakeSettings(psql="17.5"))
+    with pytest.raises(JobError) as exc:
+        job.execute(make_plan(dump_file, local_conn))
+    msg = str(exc.value)
+    assert "unsupported column options: pg_attver" in msg and "psql 17.5" in msg
+    assert "17.6+, 16.10+, 15.14+, 14.19+, 13.22+ or 18+" in msg
+    assert msg.endswith("Nothing was changed.")
+    assert run.calls == [] and not cap.called("pg_stat_activity")

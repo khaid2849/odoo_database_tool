@@ -46,6 +46,10 @@ _COLUMN_OPTIONS_RE = re.compile(
 _OPTION_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=[^\s,()=';]+")
 # pg_restore 17.6+/18 brackets its scripts with these; any other meta-command could run code.
 _ALLOWED_META_RE = re.compile(r"\s*\\(?:un)?restrict [A-Za-z0-9]+\s*")
+_RESTRICT_RE = re.compile(r"\\restrict [A-Za-z0-9]+\s*")
+# First minor of each major whose psql/pg_restore have \restrict; every release from 18 has it.
+_RESTRICT_MINOR = {17: 6, 16: 10, 15: 14, 14: 19, 13: 22}
+_RESTRICT_VERSIONS = "17.6+, 16.10+, 15.14+, 14.19+, 13.22+ or 18+"
 _OWNER_PREFIX_NOTE = "Schema script line numbers are +1 (SET ROLE prepended)"
 
 PgOverride = Optional[Tuple[str, int]]
@@ -97,12 +101,11 @@ class RestoreOutcome:
 class _Commands:
     """Built before anything destructive runs, so a missing tool cannot strand a dropped DB."""
 
-    pre_data: Cmd  # writes the schema script; runs before anything is dropped
     dropdb: Optional[Cmd]
     createdb: Cmd
     extensions: list
-    schema: Cmd  # psql runs the filtered schema script
-    pg_restore: Cmd  # data and post-data sections
+    schema: Optional[Cmd]  # psql runs the rewritten schema script; None for a plain restore
+    pg_restore: Cmd  # every section, or only data and post-data after `schema`
 
 
 def _is_error_line(line: str) -> bool:
@@ -144,6 +147,17 @@ def filter_column_options(script: str) -> tuple:
         for name in unknown:
             skipped[name] = skipped.get(name, 0) + 1
     return "".join(kept), skipped
+
+
+def psql_supports_restrict(version: str) -> bool:
+    """Whether psql of this version knows `\\restrict` (the CVE-2025-8714 safeguard)."""
+    m = re.match(r"\s*(\d+)(?:\.(\d+))?", version or "")
+    if not m:
+        return False
+    major, minor = int(m.group(1)), int(m.group(2) or 0)
+    if major >= 18:
+        return True
+    return major in _RESTRICT_MINOR and minor >= _RESTRICT_MINOR[major]
 
 
 def find_psql_meta_command(script: str) -> int:
@@ -282,9 +296,10 @@ class RestoreJob:
                 raise JobError(f"Dump file not found: {plan.dump.path}")
             fs = self._prepare_filestore(plan)
             script = cleanup.enter_context(_temp_dir()) / "pre_data.sql"
-            cmds = self._build_commands(plan, override, script)
+            pre_data = self._cmd(self.builder.pre_data_script, plan.dump.path, script)
             # The slow local extraction goes first so the checks below stay close to dropdb.
-            self._write_schema_script(plan, cmds.pre_data, script, warnings)
+            rewrite = self._write_schema_script(plan, pre_data, script, warnings)
+            cmds = self._build_commands(plan, override, script if rewrite else None)
             if not plan.is_new:
                 busy = self._active(target, db, override)
                 if busy:
@@ -418,28 +433,32 @@ class RestoreJob:
             raise JobError(f"Filestore: the source {src} overlaps the destination {dest}.")
         return kind, src, dest
 
-    def _build_commands(self, plan: RestorePlan, override: PgOverride, script: Path) -> _Commands:
+    def _build_commands(self, plan: RestorePlan, override: PgOverride,
+                        script: Optional[Path]) -> _Commands:
+        """`script`: rewritten schema to run with psql; None restores everything with pg_restore."""
         t, db = plan.target, plan.db
         b = self.builder
         return _Commands(
-            pre_data=self._cmd(b.pre_data_script, plan.dump.path, script),
             dropdb=None if plan.is_new else self._cmd(b.dropdb, t, db, pg_override=override),
             createdb=self._cmd(b.createdb, t, db, plan.owner, plan.collate, plan.ctype,
                                pg_override=override),
             extensions=[(ext, self._cmd(b.psql, t, db, f'CREATE EXTENSION IF NOT EXISTS "{ext}"',
                                         pg_override=override))
                         for ext in plan.dump.toc.extensions],
-            schema=self._cmd(b.psql_script, t, db, script, pg_override=override),
+            schema=None if script is None else self._cmd(b.psql_script, t, db, script,
+                                                         pg_override=override),
             pg_restore=self._cmd(b.pg_restore, t, db, plan.dump.path, plan.owner, plan.jobs,
-                                 sections=("data", "post-data"), pg_override=override),
+                                 sections=None if script is None else ("data", "post-data"),
+                                 pg_override=override),
         )
 
     def _write_schema_script(self, plan: RestorePlan, cmd: Cmd, script: Path,
-                             warnings: list) -> None:
-        """Extract the pre-data script, drop unknown column options and run it as the owner.
+                             warnings: list) -> bool:
+        """Extract the pre-data script; True when it must be rewritten and run with psql.
 
-        pg_restore runs a table's CREATE and its ALTERs as one unit, so a single option the
-        target does not know (e.g. pg_attver) would lose the whole table.
+        pg_restore runs a table's CREATE and its ALTERs as one unit, so a single column option
+        the target does not know (e.g. pg_attver) would lose the whole table. Only then is the
+        schema rewritten, and only with the \\restrict safeguard against meta-command injection.
         """
         name = plan.dump.path.name
         self.ctx.progress(None, "Reading the schema…")
@@ -450,21 +469,41 @@ class RestoreJob:
                            f"{self._red(last_line(err)) or f'exit {rc}'}. Nothing was changed.")
         try:
             text = script.read_bytes().decode("utf-8", errors="surrogateescape")
-            text, skipped = filter_column_options(text)
-            text = f'SET ROLE "{plan.owner}";\n{text}'
-            # Names with newlines can smuggle psql meta-commands (CVE-2025-8714 class).
-            line = find_psql_meta_command(text)
-            if line:
-                raise JobError(f"The schema script contains psql meta-commands (line {line}); "
-                               "refusing to run it. Nothing was changed.")
+        except OSError as exc:
+            raise JobError(f"Cannot read the schema script: {exc.strerror or exc}. "
+                           "Nothing was changed.") from None
+        text, skipped = filter_column_options(text)
+        if not skipped:
+            return False
+        self._require_restrict(text, sorted(skipped))
+        text = f'SET ROLE "{plan.owner}";\n{text}'
+        line = find_psql_meta_command(text)  # defense in depth on top of \\restrict
+        if line:
+            raise JobError(f"The schema script contains psql meta-commands (line {line}); "
+                           "refusing to run it. Nothing was changed.")
+        try:
             script.write_bytes(text.encode("utf-8", errors="surrogateescape"))
         except OSError as exc:
-            raise JobError(f"Cannot prepare the schema script: {exc.strerror or exc}. "
+            raise JobError(f"Cannot write the schema script: {exc.strerror or exc}. "
                            "Nothing was changed.") from None
-        if skipped:
-            detail = ", ".join(f"{opt} ({n})" for opt, n in sorted(skipped.items()))
-            self._warn(warnings, f"Skipped {sum(skipped.values())} column option(s) not "
-                                 f"supported by the target server: {detail}.")
+        detail = ", ".join(f"{opt} ({n})" for opt, n in sorted(skipped.items()))
+        self._warn(warnings, f"Skipped {sum(skipped.values())} column option(s) not supported "
+                             f"by the target server: {detail}.")
+        return True
+
+    def _require_restrict(self, script: str, options: list) -> None:
+        """Refuse the psql path unless both the script and psql carry the \\restrict safeguard."""
+        need = (f"This dump needs a schema rewrite (unsupported column options: "
+                f"{', '.join(options)}), which requires ")
+        retry = "Update pg_restore and psql, then retry. Nothing was changed."
+        if not any(_RESTRICT_RE.fullmatch(ln.rstrip("\r")) for ln in script.split("\n")):
+            raise JobError(need + "PostgreSQL client tools with the \\restrict safeguard "
+                           f"({_RESTRICT_VERSIONS}). {retry}")
+        psql = self.settings.tool("psql")
+        if psql is None or not psql_supports_restrict(psql.version):
+            found = f"psql {psql.version}" if psql else "no psql"
+            raise JobError(need + f"psql with the \\restrict safeguard ({_RESTRICT_VERSIONS}); "
+                           f"found {found}. {retry}")
 
     def _create_log(self, plan: RestorePlan) -> Path:
         path = plan.dump.path.parent / f"restore_{plan.db}_{timestamp()}.log"
@@ -502,23 +541,24 @@ class RestoreJob:
 
     def _restore_data(self, plan: RestorePlan, cmds: _Commands, log_path: Path,
                       warnings: list) -> tuple:
-        """Schema script, then pg_restore data and post-data, both writing stderr to the log.
+        """pg_restore (after the psql schema script, if any), all stderr going to the log.
 
         Returns (failure reason or "", pg_restore result or None, error lines).
         """
         self.ctx.log(f"Restoring {plan.dump.path.name} into {plan.db} (log: {log_path})")
         log_failed: list = []
         results = []
+        reason, data = "", None
         with open(log_path, "w", encoding="utf-8") as fh:
-            self.ctx.progress(None, "Restoring the schema…")
-            fh.write(_OWNER_PREFIX_NOTE + "\n")
-            self.ctx.log(_OWNER_PREFIX_NOTE)
-            schema, _ignored = self._run_logged(cmds.schema, fh, log_failed)
-            results.append(schema)
-            reason = self._hard_failure(schema, False, "psql", "schema restore")
-            if not reason and self.ctx.cancel.cancelled:
-                reason = "cancelled during the schema restore"
-            data = None
+            if cmds.schema is not None:
+                self.ctx.progress(None, "Restoring the schema…")
+                fh.write(_OWNER_PREFIX_NOTE + "\n")
+                self.ctx.log(_OWNER_PREFIX_NOTE)
+                schema, _ignored = self._run_logged(cmds.schema, fh, log_failed)
+                results.append(schema)
+                reason = self._hard_failure(schema, False, "psql", "schema restore")
+                if not reason and self.ctx.cancel.cancelled:
+                    reason = "cancelled during the schema restore"
             if not reason:
                 self.ctx.progress(None, "Restoring data…")
                 data, ignored = self._run_logged(cmds.pg_restore, fh, log_failed)
