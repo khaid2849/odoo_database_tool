@@ -60,6 +60,9 @@ def test_supports_askpass(v, ok):
     ("ssh: Could not resolve hostname x", 255, "unreachable"),
     ("client_loop: send disconnect: Broken pipe", 255, "connection_lost"),
     ("something else", 1, None),
+    ("Got permission denied while trying to connect to the Docker daemon socket at "
+     "unix:///var/run/docker.sock", 1, None),
+    ("psql: error: connection to server at \"h\" failed: Connection refused", 2, None),
     ("", 0, None)])
 def test_classify_ssh_error(stderr, rc, kind):
     assert classify_ssh_error(stderr, rc) == kind
@@ -115,3 +118,13 @@ def test_tunnel_failure_reports_auth(tmp_path):
     with pytest.raises(RuntimeError, match="auth"):
         with Tunnel(fake, SshTarget(host="h"), "c1", "db", 5432):
             pass
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="shebang fake ssh")
+def test_tunnel_password_uses_tunnel_secret_field(tmp_path):
+    out = tmp_path / "env.txt"
+    fake = _fake_ssh(tmp_path, "    import os\n    open(%r, 'w').write(os.environ['ODT_ASKPASS_KEY'])\n" % str(out)
+                     + LISTENER)
+    with Tunnel(fake, SshTarget(host="h", use_password=True), "c9", "db", 5432):
+        pass
+    assert out.read_text() == "c9:tunnel_password"

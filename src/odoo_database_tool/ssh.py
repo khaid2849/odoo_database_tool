@@ -6,6 +6,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -145,7 +146,7 @@ def add_known_host(lines: list[str], known_hosts: Path | None = None) -> None:
 
 
 def classify_ssh_error(stderr: str, rc: int) -> str | None:
-    if rc == 0:
+    if rc != 255:  # ssh itself only exits 255; other codes come from remote commands
         return None
     s = (stderr or "").lower()
     if "host identification has changed" in s:
@@ -183,9 +184,11 @@ class Tunnel:
     """`ssh -N -L` to remote_host:remote_port on a free local port, as a context manager."""
 
     def __init__(self, ssh_bin: str, t: SshTarget, conn_id: str,
-                 remote_host: str, remote_port: int):
+                 remote_host: str, remote_port: int, secret_field: str = "tunnel_password"):
         self.ssh_bin, self.t, self.conn_id = ssh_bin, t, conn_id
         self.remote_host, self.remote_port = remote_host, remote_port
+        self.secret_field = secret_field
+        self._err = None
         self.local_port = 0
         self._proc: subprocess.Popen | None = None
 
@@ -196,10 +199,12 @@ class Tunnel:
             "-L", f"127.0.0.1:{self.local_port}:{self.remote_host}:{self.remote_port}"])
         env = dict(os.environ)
         if self.t.use_password:
-            env.update(askpass_env(self.conn_id, "ssh_password"))
+            env.update(askpass_env(self.conn_id, self.secret_field))
+        # stderr goes to a file: an undrained pipe could block ssh during long dumps
+        self._err = tempfile.TemporaryFile()
         self._proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                      text=True, **_NO_WINDOW)
+                                      stdout=subprocess.DEVNULL, stderr=self._err,
+                                      **_NO_WINDOW)
         try:
             self._wait_ready()
         except BaseException:
@@ -212,8 +217,7 @@ class Tunnel:
         while time.monotonic() < deadline:
             rc = self._proc.poll()
             if rc is not None:
-                err = self._proc.stderr.read() if self._proc.stderr else ""
-                kind = classify_ssh_error(err, rc)
+                kind = classify_ssh_error(self._stderr_text(), rc)
                 reason = _REASONS.get(kind or "", "ssh exited with code %d" % rc)
                 raise RuntimeError(f"SSH tunnel failed: {reason} ({kind or 'error'})")
             try:
@@ -221,7 +225,15 @@ class Tunnel:
                     return
             except OSError:
                 time.sleep(0.1)
-        raise RuntimeError("SSH tunnel failed: timed out waiting for the local port")
+        kind = classify_ssh_error(self._stderr_text(), 255)
+        reason = _REASONS.get(kind or "", "timed out waiting for the local port")
+        raise RuntimeError(f"SSH tunnel failed: {reason} ({kind or 'timeout'})")
+
+    def _stderr_text(self) -> str:
+        if self._err is None:
+            return ""
+        self._err.seek(0)
+        return self._err.read().decode(errors="replace")
 
     def _stop(self) -> None:
         p = self._proc
@@ -234,8 +246,9 @@ class Tunnel:
             except subprocess.TimeoutExpired:
                 p.kill()
                 p.wait()
-        if p.stderr:
-            p.stderr.close()
+        if self._err:
+            self._err.close()
+            self._err = None
 
     def __exit__(self, *exc) -> None:
         self._stop()
