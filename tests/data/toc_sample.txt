@@ -1,0 +1,24 @@
+;
+; Archive created at 2026-11-23 10:15:02 +07
+;     dbname: odoo_dev
+;     TOC Entries: 9
+;     Compression: gzip
+;     Dump Version: 1.16-0
+;     Format: CUSTOM
+;     Integer: 4 bytes
+;     Offset: 8 bytes
+;     Dumped from database version: 17.12 (Ubuntu 17.12-1.pgdg24.04+1)
+;     Dumped by pg_dump version: 17.4 (Ubuntu 17.4-1.pgdg24.04+2)
+;
+;
+; Selected TOC Entries:
+;
+3; 3079 16385 EXTENSION - vector 
+4512; 0 0 COMMENT - EXTENSION vector 
+220; 1259 17001 TABLE public res_partner odoo
+221; 1259 17010 TABLE public res_users odoo
+222; 1259 17020 TABLE public ir_module_module odoo
+5001; 0 17001 TABLE DATA public res_partner odoo
+5002; 0 17010 TABLE DATA public res_users odoo
+5003; 0 17020 TABLE DATA public ir_module_module odoo
+5100; 2606 17100 CONSTRAINT public res_partner res_partner_pkey odoo
