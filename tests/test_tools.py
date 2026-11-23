@@ -24,9 +24,18 @@ posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell scr
     ("pg_dump (PostgreSQL) 17.4\n", "17.4"),
     ("garbage", None),
     ("", None),
+    ("psql (PostgreSQL) 18beta1", "18beta1"),  # pre-release suffixes stay visible
+    ("psql (PostgreSQL) 18rc1 (Homebrew)", "18rc1"),
+    ("pg_restore (PostgreSQL) 19devel", "19devel"),
 ])
 def test_parse_pg_version(text, expected):
     assert parse_pg_version(text) == expected
+
+
+def test_release_outranks_its_pre_release():
+    key = lambda v: tools._version_key(ToolInfo("psql", "/x", v))  # noqa: E731
+    assert key("18.0") > key("18rc1") and key("18rc1") > key("17.6")
+    assert key("18.10") > key("18.9") and key("9.6.3") < key("10.1")
 
 
 @pytest.mark.parametrize("version,major", [

@@ -16,7 +16,7 @@ from odoo_database_tool.models import Connection, Kind, SshTarget
 from odoo_database_tool.restore import (Activity, DumpInfo, RestoreJob, RestorePlan,
                                         count_restore_errors, filter_column_options,
                                         find_psql_meta_command, inspect_dump,
-                                        psql_supports_restrict)
+                                        supports_restrict)
 from odoo_database_tool.runner import CancelToken, Redactor, RunResult
 from odoo_database_tool.store import Secrets
 from odoo_database_tool.tools import ToolInfo
@@ -47,8 +47,9 @@ PRE_DATA = (
 )
 PG_ATTVER_LINE = "ALTER TABLE ONLY public.res_users ALTER COLUMN id SET (pg_attver=27258152);\n"
 # What pg_restore 17.6+ writes for a dump that needs the rewrite, and the script psql then runs.
-REWRITE = "\\restrict k3Y\n" + PRE_DATA + PG_ATTVER_LINE + "\\unrestrict k3Y\n"
-REWRITTEN = 'SET ROLE "odoo";\n\\restrict k3Y\n' + PRE_DATA + "\\unrestrict k3Y\n"
+HEADER = "--\n-- PostgreSQL database dump\n--\n\n\\restrict k3Y\n\n"
+REWRITE = HEADER + PRE_DATA + PG_ATTVER_LINE + "\\unrestrict k3Y\n"
+REWRITTEN = 'SET ROLE "odoo";\n' + HEADER + PRE_DATA + "\\unrestrict k3Y\n"
 
 
 def file_arg(cmd):
@@ -64,11 +65,14 @@ def writes_script(text):
 
 
 class FakeSettings:
-    def __init__(self, psql="18.6"):
-        self.psql = psql
+    """Every tool 17.2, except psql and pg_restore (None = not found)."""
+
+    def __init__(self, psql="18.6", pg_restore="18.6"):
+        self.versions = {"psql": psql, "pg_restore": pg_restore}
 
     def tool(self, name):
-        return ToolInfo(name, f"/pg/bin/{name}", self.psql if name == "psql" else "17.2")
+        version = self.versions.get(name, "17.2")
+        return ToolInfo(name, f"/pg/bin/{name}", version) if version else None
 
 
 class FakeCapture:
@@ -1100,12 +1104,16 @@ def test_shortfall_counts_only_public_table_data(secrets, ctx, local_conn, dump_
 
 def test_find_psql_meta_command():
     allowed = "SET x = 1;\n\\restrict AbC123\nSELECT 1;\n\\unrestrict AbC123\n"
-    assert find_psql_meta_command(allowed) == 0
-    assert find_psql_meta_command("SELECT 'a\\b';\nSELECT 1;\n") == 0
-    assert find_psql_meta_command("SET x = 1;\n-- Name: x\n\\! touch /tmp/x\n") == 3
-    assert find_psql_meta_command("SELECT 1;\n   \\copy t from program 'x'\n") == 2
-    assert find_psql_meta_command("\\restrict\n") == 1  # a key is required
-    assert find_psql_meta_command("\\restrict k extra\n") == 1
+    assert find_psql_meta_command(allowed, "AbC123") == 0
+    assert find_psql_meta_command(allowed, "other") == 2  # only the script's own key
+    assert find_psql_meta_command(allowed, "") == 2
+    assert find_psql_meta_command("\\restrict k\n\\restrict k\n", "k") == 2  # only one
+    assert find_psql_meta_command("\\restrict k\n\\unrestrict x\n", "k") == 2
+    assert find_psql_meta_command("SELECT 'a\\b';\nSELECT 1;\n", "k") == 0
+    assert find_psql_meta_command("SET x = 1;\n-- Name: x\n\\! touch /tmp/x\n", "k") == 3
+    assert find_psql_meta_command("SELECT 1;\n   \\copy t from program 'x'\n", "k") == 2
+    assert find_psql_meta_command("\\restrict\n", "k") == 1  # a key is required
+    assert find_psql_meta_command("\\restrict k extra\n", "k") == 1
 
 
 @pytest.mark.parametrize("bad", ["\\! touch x\n", "  \\! touch x\n", "\\i /etc/passwd\n"])
@@ -1117,8 +1125,8 @@ def test_meta_command_in_schema_refuses_before_anything(secrets, ctx, local_conn
     job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
     with pytest.raises(JobError) as exc:
         job.execute(make_plan(dump_file, local_conn))
-    # line 1 is the prepended SET ROLE, 2 \restrict, 3 the comment
-    assert str(exc.value) == ("The schema script contains psql meta-commands (line 4); refusing "
+    # SET ROLE, the 4-line header comment, \restrict, a blank line, the comment, then `bad`
+    assert str(exc.value) == ("The schema script contains psql meta-commands (line 9); refusing "
                               "to run it. Nothing was changed.")
     assert run.calls == [] and not cap.called("pg_stat_activity")
     assert not list(dump_file.parent.glob("restore_*.log"))
@@ -1152,11 +1160,12 @@ def test_plain_restore_log_has_no_offset_note(secrets, ctx, local_conn, dump_fil
 @pytest.mark.parametrize("version, ok", [
     ("12.22", False), ("13.21", False), ("13.22", True), ("14.18", False), ("14.19", True),
     ("15.13", False), ("15.14", True), ("16.9", False), ("16.10", True), ("17.5", False),
-    ("17.6", True), ("17.12 (Homebrew)", True), ("18.0", True), ("18beta1", True),
-    ("19devel", True), ("9.6.24", False), ("", False),
+    ("17.6", True), ("17.12 (Homebrew)", True), ("18.0", True), ("19.2", True),
+    ("18beta1", False), ("18rc1", False), ("19devel", False), ("17.6rc1", False),
+    ("9.6.24", False), ("", False),
 ])
-def test_psql_supports_restrict(version, ok):
-    assert psql_supports_restrict(version) is ok
+def test_supports_restrict(version, ok):
+    assert supports_restrict(version) is ok
 
 
 def test_dump_without_unknown_options_keeps_the_single_pg_restore(secrets, ctx, local_conn,
@@ -1200,29 +1209,66 @@ def test_unknown_options_use_the_psql_path(secrets, ctx, local_conn, dump_file):
             in outcome.warnings)
 
 
+def refused(job, cap, run, dump_file, plan):
+    """Run execute expecting a refusal before anything ran; returns the message."""
+    with pytest.raises(JobError) as exc:
+        job.execute(plan)
+    assert run.calls == [] and not cap.called("pg_stat_activity")
+    assert not list(dump_file.parent.glob("restore_*.log"))
+    assert not file_arg_from(cap.called("--section=pre-data")[0]).parent.exists()
+    return str(exc.value)
+
+
+NEEDS = ("This dump needs a schema rewrite (unsupported column options: pg_attver), which "
+         "requires PostgreSQL client tools with the \\restrict safeguard (17.6+, 16.10+, "
+         "15.14+, 14.19+, 13.22+ or 18+).")
+
+
 def test_rewrite_without_restrict_refuses_before_drop(secrets, ctx, local_conn, dump_file):
     events = []
     cap = rewrite_capture(events, PRE_DATA + PG_ATTVER_LINE)
     job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
-    with pytest.raises(JobError) as exc:
-        job.execute(make_plan(dump_file, local_conn))
-    assert str(exc.value) == (
-        "This dump needs a schema rewrite (unsupported column options: pg_attver), which "
-        "requires PostgreSQL client tools with the \\restrict safeguard (17.6+, 16.10+, 15.14+, "
-        "14.19+, 13.22+ or 18+). Update pg_restore and psql, then retry. Nothing was changed.")
-    assert run.calls == [] and not cap.called("pg_stat_activity")
-    assert not list(dump_file.parent.glob("restore_*.log"))
+    assert refused(job, cap, run, dump_file, make_plan(dump_file, local_conn)) == (
+        NEEDS + " Update pg_restore and psql, then retry. Nothing was changed.")
 
 
-def test_rewrite_with_old_psql_refuses_before_drop(secrets, ctx, local_conn, dump_file):
+@pytest.mark.parametrize("pg_restore, psql, found", [
+    ("18.6", "17.5", "Found pg_restore 18.6 / psql 17.5."),
+    ("17.5", "18.6", "Found pg_restore 17.5 / psql 18.6."),  # old pg_restore keeps raw newlines
+    ("18.6", "18rc1", "Found pg_restore 18.6 / psql 18rc1."),
+    ("18.6", None, "Found pg_restore 18.6 / psql not found."),
+])
+def test_rewrite_with_old_tools_refuses_before_drop(secrets, ctx, local_conn, dump_file,
+                                                    pg_restore, psql, found):
     events = []
     cap = rewrite_capture(events)
     job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events,
-                              settings=FakeSettings(psql="17.5"))
-    with pytest.raises(JobError) as exc:
-        job.execute(make_plan(dump_file, local_conn))
-    msg = str(exc.value)
-    assert "unsupported column options: pg_attver" in msg and "psql 17.5" in msg
-    assert "17.6+, 16.10+, 15.14+, 14.19+, 13.22+ or 18+" in msg
-    assert msg.endswith("Nothing was changed.")
-    assert run.calls == [] and not cap.called("pg_stat_activity")
+                              settings=FakeSettings(psql=psql, pg_restore=pg_restore))
+    assert refused(job, cap, run, dump_file, make_plan(dump_file, local_conn)) == (
+        f"{NEEDS} {found} Update them, then retry. Nothing was changed.")
+
+
+@pytest.mark.parametrize("script, line", [
+    # the CVE-2025-8715 shape: a name with newlines puts code before an attacker's \restrict
+    ("--\n-- Name: x\nSELECT 1 \\! touch /tmp/x\n\\restrict abc\n" + PRE_DATA + PG_ATTVER_LINE,
+     4),
+    (PRE_DATA + PG_ATTVER_LINE + "\\restrict abc\n", 2),
+])
+def test_restrict_must_open_the_script(secrets, ctx, local_conn, dump_file, script, line):
+    events = []
+    cap = rewrite_capture(events, script)
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    assert refused(job, cap, run, dump_file, make_plan(dump_file, local_conn)) == (
+        f"The schema script does not start with \\restrict (line {line}); refusing to run it. "
+        "Nothing was changed.")
+
+
+@pytest.mark.parametrize("extra", ["\\unrestrict other\n", "\\restrict k3Y\n",
+                                   "\\restrict zzz\n"])
+def test_second_restrict_or_foreign_unrestrict_refuses(secrets, ctx, local_conn, dump_file,
+                                                       extra):
+    events = []
+    cap = rewrite_capture(events, REWRITE.replace("CREATE TABLE", extra + "CREATE TABLE"))
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    msg = refused(job, cap, run, dump_file, make_plan(dump_file, local_conn))
+    assert msg.startswith("The schema script contains psql meta-commands (line ")

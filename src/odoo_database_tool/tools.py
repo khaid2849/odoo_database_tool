@@ -41,8 +41,8 @@ class ToolInfo:
 
 
 def parse_pg_version(text: str) -> str | None:
-    """Version number from `<tool> --version` output, e.g. '18.6'."""
-    m = re.search(r"\(PostgreSQL\)\s+(\d+(?:\.\d+)*)", text or "")
+    """Version number from `<tool> --version` output, e.g. '18.6' or '19devel'."""
+    m = re.search(r"\(PostgreSQL\)\s+(\d+(?:\.\d+)*(?:devel|(?:alpha|beta|rc)\d*)?)", text or "")
     return m.group(1) if m else None
 
 
@@ -107,7 +107,10 @@ def _probe(name: str, path: str) -> ToolInfo | None:
 
 
 def _version_key(info: ToolInfo) -> tuple:
-    return tuple(int(n) for n in re.findall(r"\d+", info.version))
+    """Numeric parts, then 1 for a release so it outranks its pre-releases (18.0 > 18rc1)."""
+    m = re.match(r"\d+(?:\.\d+)*", info.version)
+    numbers = tuple(int(n) for n in m.group(0).split(".")) if m else ()
+    return numbers + (0 if not m or m.end() < len(info.version) else 1,)
 
 
 def detect_tool(name: str, override: str = "") -> ToolInfo | None:

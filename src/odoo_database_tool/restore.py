@@ -45,8 +45,8 @@ _COLUMN_OPTIONS_RE = re.compile(
     rf"ALTER TABLE (?:ONLY )?{_IDENT}(?:\.{_IDENT})? ALTER COLUMN {_IDENT} SET \((.+)\);")
 _OPTION_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=[^\s,()=';]+")
 # pg_restore 17.6+/18 brackets its scripts with these; any other meta-command could run code.
-_ALLOWED_META_RE = re.compile(r"\s*\\(?:un)?restrict [A-Za-z0-9]+\s*")
-_RESTRICT_RE = re.compile(r"\\restrict [A-Za-z0-9]+\s*")
+_ALLOWED_META_RE = re.compile(r"\s*\\(restrict|unrestrict) ([A-Za-z0-9]+)\s*")
+_RESTRICT_RE = re.compile(r"\\restrict ([A-Za-z0-9]+)\s*")
 # First minor of each major whose psql/pg_restore have \restrict; every release from 18 has it.
 _RESTRICT_MINOR = {17: 6, 16: 10, 15: 14, 14: 19, 13: 22}
 _RESTRICT_VERSIONS = "17.6+, 16.10+, 15.14+, 14.19+, 13.22+ or 18+"
@@ -149,9 +149,12 @@ def filter_column_options(script: str) -> tuple:
     return "".join(kept), skipped
 
 
-def psql_supports_restrict(version: str) -> bool:
-    """Whether psql of this version knows `\\restrict` (the CVE-2025-8714 safeguard)."""
-    m = re.match(r"\s*(\d+)(?:\.(\d+))?", version or "")
+def supports_restrict(version: str) -> bool:
+    """Whether pg_restore/psql of this release have the `\\restrict` safeguard (CVE-2025-8714).
+
+    Pre-releases (18beta1, 19devel) are refused: their fixes cannot be told from the number.
+    """
+    m = re.match(r"\s*(\d+)(?:\.(\d+))?(?![\w.])", version or "")
     if not m:
         return False
     major, minor = int(m.group(1)), int(m.group(2) or 0)
@@ -160,15 +163,34 @@ def psql_supports_restrict(version: str) -> bool:
     return major in _RESTRICT_MINOR and minor >= _RESTRICT_MINOR[major]
 
 
-def find_psql_meta_command(script: str) -> int:
+def find_psql_meta_command(script: str, key: str) -> int:
     """1-based number of the first line starting with a backslash, or 0.
 
-    Only `\\restrict <key>` / `\\unrestrict <key>` lines are allowed.
+    Allowed: one `\\restrict <key>` and any `\\unrestrict <key>`, with the script's own key.
+    """
+    restricted = False
+    for number, line in enumerate(script.split("\n"), 1):
+        if not line.lstrip().startswith("\\"):
+            continue
+        m = _ALLOWED_META_RE.fullmatch(line.rstrip("\r"))
+        if not key or not m or m.group(2) != key or (m.group(1) == "restrict" and restricted):
+            return number
+        restricted = restricted or m.group(1) == "restrict"
+    return 0
+
+
+def _restrict_key(script: str) -> tuple:
+    """(key, 0) when `\\restrict <key>` opens the script, else ("", number of the first line).
+
+    Only blank lines and `--` comments may come before it.
     """
     for number, line in enumerate(script.split("\n"), 1):
-        if line.lstrip().startswith("\\") and not _ALLOWED_META_RE.fullmatch(line.rstrip("\r")):
-            return number
-    return 0
+        line = line.rstrip("\r")
+        if not line.strip() or line.startswith("--"):
+            continue
+        m = _RESTRICT_RE.fullmatch(line)
+        return (m.group(1), 0) if m else ("", number)
+    return "", 0
 
 
 @contextmanager
@@ -475,9 +497,9 @@ class RestoreJob:
         text, skipped = filter_column_options(text)
         if not skipped:
             return False
-        self._require_restrict(text, sorted(skipped))
+        key = self._require_restrict(text, sorted(skipped))
         text = f'SET ROLE "{plan.owner}";\n{text}'
-        line = find_psql_meta_command(text)  # defense in depth on top of \\restrict
+        line = find_psql_meta_command(text, key)  # defense in depth on top of \\restrict
         if line:
             raise JobError(f"The schema script contains psql meta-commands (line {line}); "
                            "refusing to run it. Nothing was changed.")
@@ -491,19 +513,28 @@ class RestoreJob:
                              f"by the target server: {detail}.")
         return True
 
-    def _require_restrict(self, script: str, options: list) -> None:
-        """Refuse the psql path unless both the script and psql carry the \\restrict safeguard."""
+    def _require_restrict(self, script: str, options: list) -> str:
+        """The script's \\restrict key, once both tools and the script carry the safeguard.
+
+        The key must open the script: an older pg_restore keeps newlines in object names, so a
+        later \\restrict could be planted after meta-commands that psql would already have run.
+        """
         need = (f"This dump needs a schema rewrite (unsupported column options: "
-                f"{', '.join(options)}), which requires ")
-        retry = "Update pg_restore and psql, then retry. Nothing was changed."
+                f"{', '.join(options)}), which requires PostgreSQL client tools with the "
+                f"\\restrict safeguard ({_RESTRICT_VERSIONS}).")
+        tools = [self.settings.tool(name) for name in ("pg_restore", "psql")]
+        if not all(info is not None and supports_restrict(info.version) for info in tools):
+            found = " / ".join(f"{name} {info.version}" if info else f"{name} not found"
+                               for name, info in zip(("pg_restore", "psql"), tools))
+            raise JobError(f"{need} Found {found}. Update them, then retry. Nothing was changed.")
+        key, line = _restrict_key(script)
+        if key:
+            return key
         if not any(_RESTRICT_RE.fullmatch(ln.rstrip("\r")) for ln in script.split("\n")):
-            raise JobError(need + "PostgreSQL client tools with the \\restrict safeguard "
-                           f"({_RESTRICT_VERSIONS}). {retry}")
-        psql = self.settings.tool("psql")
-        if psql is None or not psql_supports_restrict(psql.version):
-            found = f"psql {psql.version}" if psql else "no psql"
-            raise JobError(need + f"psql with the \\restrict safeguard ({_RESTRICT_VERSIONS}); "
-                           f"found {found}. {retry}")
+            raise JobError(f"{need} Update pg_restore and psql, then retry. Nothing was changed.")
+        # numbered as psql would see it, after the SET ROLE line
+        raise JobError(f"The schema script does not start with \\restrict (line {line + 1}); "
+                       "refusing to run it. Nothing was changed.")
 
     def _create_log(self, plan: RestorePlan) -> Path:
         path = plan.dump.path.parent / f"restore_{plan.db}_{timestamp()}.log"
