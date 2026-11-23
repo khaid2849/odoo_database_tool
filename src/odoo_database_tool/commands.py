@@ -138,11 +138,18 @@ class CommandBuilder:
         return self._local_pg(conn, "createdb", args, pg_override)
 
     def pg_restore(self, conn: Connection, db: str, dump: Path, owner: str, jobs: int,
-                   *, pg_override=None) -> Cmd:
+                   *, sections=None, pg_override=None) -> Cmd:
+        """`sections` (e.g. ("data", "post-data")) limits the restore; None restores all."""
         validate_identifier(db, "database name")
-        args = ["--no-owner", "--no-privileges", f"--role={owner}",
-                "-j", str(max(1, int(jobs))), "-d", db, str(dump)]
+        args = [f"--section={s}" for s in sections or ()]
+        args += ["--no-owner", "--no-privileges", f"--role={owner}",
+                 "-j", str(max(1, int(jobs))), "-d", db, str(dump)]
         return self._local_pg(conn, "pg_restore", args, pg_override)
+
+    def pre_data_script(self, dump: Path, out_file: Path) -> Cmd:
+        """Write the dump's pre-data section as a SQL script; no server is contacted."""
+        return Cmd([self._tool("pg_restore"), "--section=pre-data", "--no-owner",
+                    "--no-privileges", "-f", str(out_file), str(dump)])
 
     def vacuum_analyze(self, conn: Connection, db: str, *, pg_override=None) -> Cmd:
         validate_identifier(db, "database name")
@@ -153,6 +160,12 @@ class CommandBuilder:
         validate_identifier(db, "database name")
         args = ["-X", "-v", "ON_ERROR_STOP=1", "--single-transaction", "-d", db,
                 "-f", str(sql_file)]
+        return self._local_pg(conn, "psql", args, pg_override)
+
+    def psql_script(self, conn: Connection, db: str, sql_file: Path, *, pg_override=None) -> Cmd:
+        """Run a script statement by statement, carrying on past errors like pg_restore."""
+        validate_identifier(db, "database name")
+        args = ["-X", "-v", "ON_ERROR_STOP=0", "-d", db, "-f", str(sql_file)]
         return self._local_pg(conn, "psql", args, pg_override)
 
     # --- helpers -----------------------------------------------------------------

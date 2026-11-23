@@ -14,7 +14,8 @@ from odoo_database_tool.commands import CommandBuilder
 from odoo_database_tool.jobs import JobContext, JobError
 from odoo_database_tool.models import Connection, Kind, SshTarget
 from odoo_database_tool.restore import (Activity, DumpInfo, RestoreJob, RestorePlan,
-                                        count_restore_errors, inspect_dump)
+                                        count_restore_errors, filter_column_options,
+                                        inspect_dump)
 from odoo_database_tool.runner import CancelToken, Redactor, RunResult
 from odoo_database_tool.store import Secrets
 from odoo_database_tool.tools import ToolInfo
@@ -34,6 +35,28 @@ TOC_EMPTY = TOC.split("5;")[0]
 DUMP_BYTES = b"PGDMP" + b"\x00" * 1000
 PG_RESTORE = ToolInfo("pg_restore", "/pg/bin/pg_restore", "17.2")
 ACTIVITY_ROW = "4242|Odoo|odoo|10.0.0.9|2026-11-23 09:15\n"
+PRE_DATA = (
+    "SET statement_timeout = 0;\n"
+    "SELECT pg_catalog.set_config('search_path', '', false);\n"
+    "CREATE TABLE public.res_users (\n"
+    "    id integer NOT NULL,\n"
+    "    login character varying\n"
+    ");\n"
+    "ALTER TABLE ONLY public.res_users ALTER COLUMN login SET (n_distinct=-1);\n"
+)
+PG_ATTVER_LINE = "ALTER TABLE ONLY public.res_users ALTER COLUMN id SET (pg_attver=27258152);\n"
+
+
+def file_arg(cmd):
+    return Path(cmd.argv[cmd.argv.index("-f") + 1])
+
+
+def writes_script(text):
+    """FakeCapture rule for `pg_restore --section=pre-data -f <file>`: writes the script."""
+    def rule(cmd):
+        file_arg(cmd).write_text(text, encoding="utf-8")
+        return 0, "", ""
+    return rule
 
 
 class FakeSettings:
@@ -46,6 +69,7 @@ class FakeCapture:
 
     def __init__(self, events, **overrides):
         self.rules = {
+            "--section=pre-data": writes_script(PRE_DATA),
             "pg_has_role": (0, "t\n", ""),
             "pg_stat_activity": (0, "", ""),
             "datcollate": (0, "en_US.UTF-8|en_US.UTF-8\n", ""),
@@ -68,7 +92,7 @@ class FakeCapture:
         self.events.append(joined)
         for key, result in self.rules.items():
             if key in joined:
-                return result
+                return result(cmd) if callable(result) else result
         raise AssertionError(f"unexpected command: {joined}")
 
     def called(self, key):
@@ -80,11 +104,13 @@ class FakeRun:
 
     def __init__(self, events, **scripts):
         self.scripts = {"dropdb": (0, [], False, ""), "createdb": (0, [], False, ""),
+                        "ON_ERROR_STOP=0": (0, [], False, ""),
                         "pg_restore": (0, [], False, ""), "vacuumdb": (0, [], False, "")}
         self.scripts.update(scripts)
         self.events = events
         self.calls = []
         self.cancel_passed = {}
+        self.scripts_seen = {}  # path -> content of a `-f` file when it ran
 
     def __call__(self, cmd, out_path, *, on_bytes=None, on_line=None, cancel=None,
                  redactor=None, tail=200):
@@ -95,6 +121,8 @@ class FakeRun:
             if key in joined:
                 self.cancel_passed[key] = cancel is not None
                 assert out_path is None
+                if "-f" in cmd.argv:
+                    self.scripts_seen[file_arg(cmd)] = file_arg(cmd).read_text(encoding="utf-8")
                 for line in stderr:
                     line = redactor(line) if redactor else line
                     if on_line:
@@ -188,7 +216,11 @@ def tool_order(events):
     """Basenames of the local tools run, with CREATE EXTENSION shown as its own step."""
     out = []
     for e in events:
-        if "CREATE EXTENSION" in e:
+        if "--section=pre-data" in e:
+            out.append("pg_restore pre-data")
+        elif "ON_ERROR_STOP=0" in e:
+            out.append("psql script")
+        elif "CREATE EXTENSION" in e:
             out.append("psql CREATE EXTENSION " + re.search(r'"([^"]+)"', e).group(1))
         else:
             out.append(Path(e.split(" ")[0]).name)
@@ -349,12 +381,19 @@ def test_execute_happy_path_order(secrets, ctx, local_conn, dump_file):
     job, cap, run, events = make_job(secrets, ctx)
     outcome = job.execute(make_plan(dump_file, local_conn))
     steps = [s for s in tool_order(events) if s != "psql"]  # drop the read-only queries
-    assert steps == ["dropdb", "createdb", "psql CREATE EXTENSION vector", "pg_restore", "vacuumdb"]
+    assert steps == ["pg_restore pre-data", "dropdb", "createdb", "psql CREATE EXTENSION vector",
+                     "psql script", "pg_restore", "vacuumdb"]
     assert tool_order(events)[0] == "psql"  # active-connections check runs first
     create = run.called("createdb")[0]
     assert "-T template0 -E UTF8 --lc-collate=C --lc-ctype=C -O odoo mydb" in create
-    restore = run.called("pg_restore")[0]
-    assert f"--no-owner --no-privileges --role=odoo -j 4 -d mydb {dump_file}" in restore
+    pre = cap.called("--section=pre-data")[0]
+    assert pre.startswith("/pg/bin/pg_restore --section=pre-data --no-owner --no-privileges -f ")
+    assert pre.endswith(f" {dump_file}") and " -d " not in pre
+    schema = run.called("ON_ERROR_STOP=0")[0]
+    assert "-X -v ON_ERROR_STOP=0 -d mydb -f " in schema and "--single-transaction" not in schema
+    restore = run.called("--section=data")[0]
+    assert (f"--section=data --section=post-data --no-owner --no-privileges --role=odoo "
+            f"-j 4 -d mydb {dump_file}") in restore
     assert outcome.status == "ok" and outcome.errors == 0
     assert outcome.log_path.parent == dump_file.parent
     assert re.fullmatch(r"restore_mydb_\d{8}-\d{4}\.log", outcome.log_path.name)
@@ -375,8 +414,8 @@ def test_new_db_skips_drop(secrets, ctx, local_conn, dump_file):
 def test_cancel_only_reaches_pg_restore(secrets, ctx, local_conn, dump_file):
     job, _, run, _ = make_job(secrets, ctx)
     job.execute(make_plan(dump_file, local_conn))
-    assert run.cancel_passed == {"dropdb": False, "createdb": False, "pg_restore": True,
-                                 "vacuumdb": False}
+    assert run.cancel_passed == {"dropdb": False, "createdb": False, "ON_ERROR_STOP=0": True,
+                                 "pg_restore": True, "vacuumdb": False}
 
 
 def test_cancel_before_drop_touches_nothing(secrets, ctx, local_conn, dump_file):
@@ -565,7 +604,8 @@ def test_tunnel_open_for_whole_execute(secrets, ctx, dump_file):
     assert len(FakeTunnel.opened) == 1
     tunnel = FakeTunnel.opened[0]
     assert tunnel.args == ("db.internal", 5432) and tunnel.closed
-    assert events and all("-h 127.0.0.1 -p 55432" in e for e in events)
+    server = [e for e in events if "--section=pre-data" not in e]  # pre-data reads the file only
+    assert server and all("-h 127.0.0.1 -p 55432" in e for e in server)
 
 
 def test_secrets_registered_before_running(secrets, ctx, local_conn, dump_file):
@@ -806,7 +846,7 @@ def test_expected_hostname_match_runs_hostname_first(secrets, ctx, dump_file):
 def test_no_expected_hostname_skips_check(secrets, ctx, dump_file):
     job, cap, _, _ = make_job(secrets, ctx)
     assert job.execute(make_plan(dump_file, tunnelled_conn("")), confirmed_text="mydb").status == "ok"
-    assert not cap.called("hostname")
+    assert not [c for c in cap.called("hostname") if "--section=pre-data" not in c]
 
 
 def test_unexpected_error_after_recreate_is_partial(secrets, ctx, local_conn, dump_file):
@@ -831,3 +871,195 @@ def test_summary_remote_has_no_typed_confirmation_line(secrets, ctx, remote_conn
     lines = job.summary(make_plan(dump_file, remote_conn))
     assert any("remote server" in line for line in lines)
     assert not any("to confirm" in line for line in lines)
+
+
+# --- unknown column options and sectioned restore -------------------------------------------
+
+KEPT_ALTERS = (
+    "ALTER TABLE ONLY public.t ALTER COLUMN c SET (n_distinct=-1);\n"
+    "ALTER TABLE ONLY public.t ALTER COLUMN c SET (n_distinct=0.5, n_distinct_inherited=-0.2);\n"
+    "ALTER TABLE ONLY public.t ALTER COLUMN c SET NOT NULL;\n"
+    "ALTER TABLE ONLY public.t ALTER COLUMN id SET DEFAULT nextval('public.t_id_seq'::regclass);\n"
+    "ALTER TABLE ONLY public.t ALTER COLUMN c SET STATISTICS 500;\n"
+    "ALTER TABLE ONLY public.t ALTER COLUMN c SET STORAGE EXTERNAL;\n"
+    "ALTER TABLE public.t OWNER TO odoo;\n"
+    "ALTER TABLE ONLY public.t SET (fillfactor=80);\n"
+    "-- ALTER TABLE ONLY public.t ALTER COLUMN c SET (pg_attver=1);\n"
+)
+
+
+def test_filter_keeps_everything_without_unknown_options():
+    text = PRE_DATA + KEPT_ALTERS + "CREATE INDEX x ON public.t USING btree (c);"
+    assert filter_column_options(text) == (text, {})
+
+
+@pytest.mark.parametrize("line, option", [
+    ("ALTER TABLE ONLY public.access_control_button ALTER COLUMN id SET (pg_attver=27258152);",
+     "pg_attver"),
+    ('ALTER TABLE ONLY public."Weird Table" ALTER COLUMN "Weird Col" SET (pg_attver=3);',
+     "pg_attver"),
+    ('ALTER TABLE ONLY "my schema".t ALTER COLUMN "a""b" SET (pg_attver=3);', "pg_attver"),
+    ("ALTER TABLE t ALTER COLUMN c SET (pg_attver=3);", "pg_attver"),
+    ("ALTER TABLE ONLY public.t ALTER COLUMN c SET (n_distinct=-1, my_opt=on);", "my_opt"),
+])
+def test_filter_drops_statements_with_unknown_options(line, option):
+    text = "CREATE TABLE public.t (c integer);\n" + line + "\n" + KEPT_ALTERS
+    out, skipped = filter_column_options(text)
+    assert out == "CREATE TABLE public.t (c integer);\n" + KEPT_ALTERS
+    assert skipped == {option: 1}
+
+
+def test_filter_counts_each_unknown_option_name():
+    lines = [f"ALTER TABLE ONLY public.t{i} ALTER COLUMN id SET (pg_attver={i});\n"
+             for i in range(3)]
+    lines.append("ALTER TABLE ONLY public.t ALTER COLUMN c SET (pg_attver=1, other_opt=2);\n")
+    out, skipped = filter_column_options("SET x = 1;\n" + "".join(lines) + "SELECT 1;")
+    assert out == "SET x = 1;\nSELECT 1;"
+    assert skipped == {"pg_attver": 4, "other_opt": 1}
+
+
+def test_filter_never_drops_lines_it_cannot_parse():
+    for line in ("ALTER TABLE ONLY public.t ALTER COLUMN c SET (pg_attver='a b');",
+                 "ALTER TABLE ONLY public.t ALTER COLUMN c SET (pg_attver=1); SELECT 1;",
+                 "  ALTER TABLE ONLY public.t ALTER COLUMN c SET (pg_attver=1);",
+                 "ALTER FOREIGN TABLE public.t ALTER COLUMN c SET (n_distinct=1);"):
+        assert filter_column_options(line + "\n") == (line + "\n", {})
+
+
+def test_schema_script_is_filtered_and_runs_as_owner(secrets, ctx, local_conn, dump_file):
+    events = []
+    cap = FakeCapture(events, **{"--section=pre-data": writes_script(
+        PRE_DATA + PG_ATTVER_LINE + PG_ATTVER_LINE.replace("COLUMN id", "COLUMN login"))})
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    assert outcome.status == "ok"
+    [(path, script)] = run.scripts_seen.items()
+    assert script == 'SET ROLE "odoo";\n' + PRE_DATA
+    assert ("Skipped 2 column option(s) not supported by the target server: pg_attver (2)."
+            in outcome.warnings)
+    assert not path.exists() and not path.parent.exists()  # temp script cleaned up
+    assert file_arg_from(cap.called("--section=pre-data")[0]) == path
+
+
+def file_arg_from(joined):
+    parts = joined.split(" ")
+    return Path(parts[parts.index("-f") + 1])
+
+
+def test_schema_script_failure_refuses_before_drop(secrets, ctx, local_conn, dump_file):
+    events = []
+    cap = FakeCapture(events, **{"--section=pre-data": (
+        1, "", "pg_restore: error: could not read from input file: end of file")})
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    with pytest.raises(JobError, match="end of file") as exc:
+        job.execute(make_plan(dump_file, local_conn))
+    assert "Nothing was changed" in str(exc.value)
+    assert run.calls == []
+    assert not list(dump_file.parent.glob("restore_*.log"))
+    assert not file_arg_from(cap.called("--section=pre-data")[0]).parent.exists()
+
+
+def test_cancel_before_drop_cleans_the_schema_script(secrets, ctx, local_conn, dump_file):
+    ctx.cancel.cancel()
+    job, cap, run, _ = make_job(secrets, ctx)
+    assert job.execute(make_plan(dump_file, local_conn)).status == "cancelled"
+    assert run.calls == []
+    assert not file_arg_from(cap.called("--section=pre-data")[0]).parent.exists()
+
+
+def test_psql_and_pg_restore_errors_share_the_log(secrets, ctx, local_conn, dump_file):
+    events = []
+    run = FakeRun(events, **{
+        "ON_ERROR_STOP=0": (0, ['psql:/tmp/x/pre_data.sql:12: ERROR:  unrecognized parameter '
+                                '"other"', "LINE 1: ALTER TABLE ..."], False, ""),
+        "pg_restore": (1, ["pg_restore: error: COPY failed for table \"t\"",
+                           "pg_restore: warning: errors ignored on restore: 1"], False, "")})
+    job, _, _, _ = make_job(secrets, ctx, run=run, events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    assert outcome.status == "ok" and outcome.errors == 2
+    text = outcome.log_path.read_text()
+    assert text.index("unrecognized parameter") < text.index("COPY failed")
+    warning = next(w for w in outcome.warnings if "2 error" in w)
+    assert "unrecognized parameter" in warning and "COPY failed" in warning
+
+
+@pytest.mark.parametrize("script, reason", [
+    ((2, ["psql:/tmp/x/pre_data.sql:40: FATAL:  terminating connection"], False, ""),
+     "psql stopped with exit code 2"),
+    ((1, ["psql: error: pre_data.sql: No such file or directory"], False, ""),
+     "psql stopped with exit code 1"),
+    ((127, [], False, "No such file or directory: '/pg/bin/psql'"), "psql could not run"),
+    ((-15, [], True, ""), "cancelled during the schema restore"),
+])
+def test_schema_step_failure_is_partial(secrets, ctx, local_conn, dump_file, script, reason):
+    events = []
+    run = FakeRun(events, **{"ON_ERROR_STOP=0": script})
+    job, cap, _, _ = make_job(secrets, ctx, run=run, events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    assert outcome.status == "partial"
+    assert not run.called("--section=data") and not run.called("vacuumdb")
+    assert not cap.called("pg_tables")
+    assert any(reason in w for w in outcome.warnings)
+    assert outcome.log_path is not None and outcome.log_path.exists()
+
+
+def test_ignored_line_from_psql_does_not_excuse_a_fatal_pg_restore(secrets, ctx, local_conn,
+                                                                   dump_file):
+    events = []
+    run = FakeRun(events, **{
+        "ON_ERROR_STOP=0": (0, ["pg_restore: warning: errors ignored on restore: 1"], False, ""),
+        "pg_restore": (1, ["pg_restore: error: connection lost"], False, "")})
+    job, _, _, _ = make_job(secrets, ctx, run=run, events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    assert outcome.status == "partial"
+    assert any("pg_restore stopped with exit code 1" in w for w in outcome.warnings)
+
+
+def test_count_restore_errors_counts_psql_errors():
+    log = ("psql:/tmp/a/pre_data.sql:7: ERROR:  unrecognized parameter \"pg_attver\"\n"
+           "psql:/tmp/a/pre_data.sql:9: NOTICE:  extension \"vector\" already exists\n"
+           "pg_restore: error: could not execute query: ERROR:  relation \"t\" does not exist\n"
+           "DETAIL:  ERROR: inside a detail line\n")
+    assert count_restore_errors(log) == 2
+
+
+def toc_with_tables(n):
+    rows = "".join(f"{10 + i}; 0 {20000 + i} TABLE DATA public t{i} odoo\n" for i in range(n))
+    return TOC_EMPTY + rows
+
+
+def test_user_scenario_no_tables_is_partial(secrets, ctx, local_conn, dump_file, tmp_path):
+    root = tmp_path / "filestore"
+    (root / "mydb" / "0a").mkdir(parents=True)
+    (root / "mydb" / "0a" / "old").write_bytes(b"old")
+    src = make_tar(tmp_path / "fs.tar", "mydb", ["0b/new"])
+    events = []
+    cap = FakeCapture(events, pg_tables=(0, "0\n", ""))
+    run = FakeRun(events, **{
+        "ON_ERROR_STOP=0": (0, [], False, ""),
+        "pg_restore": (1, ['pg_restore: error: could not execute query: ERROR:  relation '
+                           '"public.res_users" does not exist'] * 3
+                       + ["pg_restore: warning: errors ignored on restore: 3"], False, "")})
+    job, _, _, _ = make_job(secrets, ctx, capture=cap, run=run, events=events)
+    plan = make_plan(dump_file, local_conn, fs_src=src, fs_root=root, toc=toc_with_tables(2959))
+    outcome = job.execute(plan)
+    assert outcome.status == "partial" and outcome.errors == 3
+    assert f"Only 0 of 2959 tables were restored; see {outcome.log_path.name}." in outcome.warnings
+    assert not run.called("vacuumdb")
+    assert (root / "mydb" / "0a" / "old").exists() and not (root / "mydb" / "0b").exists()
+    assert outcome.quick == {} and outcome.filestore_files == 0
+    assert any("mydb is partial" in w for w in outcome.warnings)
+
+
+@pytest.mark.parametrize("tables, status", [
+    ((0, "2811\n", ""), "partial"),  # 94.99 %
+    ((0, "2812\n", ""), "ok"),       # 95.03 %
+    ((1, "", "ERROR:  boom"), "ok"),  # unknown count: the quick check shows "?"
+])
+def test_table_shortfall_threshold(secrets, ctx, local_conn, dump_file, tables, status):
+    events = []
+    cap = FakeCapture(events, pg_tables=tables)
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn, toc=toc_with_tables(2959)))
+    assert outcome.status == status
+    assert bool(run.called("vacuumdb")) == (status == "ok")

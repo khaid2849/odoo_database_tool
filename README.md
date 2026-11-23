@@ -56,6 +56,7 @@ Get the latest version from the **[Releases page](https://github.com/khaid2849/o
 - Passwords are stored in the OS keychain (or kept in memory for the session when there is none), never in files, logs or command lines.
 - A filestore is restored only on this computer, into `<root>/<database>`. An existing folder there is replaced only if it looks like an Odoo filestore (two-character hex subfolders) or is empty; nothing outside it is deleted.
 - If a restore fails after the old database was dropped, the app says so clearly and offers to drop the incomplete database or keep it.
+- Column options that exist only on the source server (for example `pg_attver`) are skipped with a warning instead of losing the tables, and a restore that leaves most tables missing is reported incomplete, never as done.
 - Neutralize warns when some installed modules are not found in your addons folders, instead of reporting the database as fully neutralized.
 - Closing the window during an operation asks first, then cancels it and closes once it has stopped.
 

@@ -1,9 +1,12 @@
 """Restore job: dump inspection, safety refusals, drop/create/restore, filestore, quick check. Qt-free."""
 from __future__ import annotations
 
+import io
 import os
+import re
 import shutil
 import tarfile
+import tempfile
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,14 +26,24 @@ _TOOLS_HINT = "Install the PostgreSQL client tools or set the path in Settings."
 _ERROR_MARK = "pg_restore: error"
 # pg_restore prints this when it ran to the end despite errors; a non-zero exit without it is fatal.
 _IGNORED_MARK = "pg_restore: warning: errors ignored on restore:"
+_TABLES_SQL = "select count(*) from pg_tables where schemaname='public'"
+# Below this share of the dump's tables the restore is reported partial, whatever the exit codes.
+_MIN_TABLES_PERCENT = 95
 _QUICK_SQL = (
     ("size", "select pg_database_size(current_database())"),
-    ("tables", "select count(*) from pg_tables where schemaname='public'"),
+    ("tables", _TABLES_SQL),
     ("active_users", "select count(*) from res_users where active"),
     ("installed_modules", "select count(*) from ir_module_module where state='installed'"),
     ("neutralized", "select value from ir_config_parameter where key='database.is_neutralized'"),
 )
 _FILE_PROGRESS_STEP = 200
+
+# Column options PostgreSQL core accepts; others come from server-specific modules (pg_attver).
+_CORE_COLUMN_OPTIONS = frozenset({"n_distinct", "n_distinct_inherited"})
+_IDENT = r'(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")'
+_COLUMN_OPTIONS_RE = re.compile(
+    rf"ALTER TABLE (?:ONLY )?{_IDENT}(?:\.{_IDENT})? ALTER COLUMN {_IDENT} SET \((.+)\);")
+_OPTION_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=[^\s,()=';]+")
 
 PgOverride = Optional[Tuple[str, int]]
 
@@ -81,15 +94,62 @@ class RestoreOutcome:
 class _Commands:
     """Built before anything destructive runs, so a missing tool cannot strand a dropped DB."""
 
+    pre_data: Cmd  # writes the schema script; runs before anything is dropped
     dropdb: Optional[Cmd]
     createdb: Cmd
     extensions: list
-    pg_restore: Cmd
+    schema: Cmd  # psql runs the filtered schema script
+    pg_restore: Cmd  # data and post-data sections
+
+
+def _is_error_line(line: str) -> bool:
+    if _ERROR_MARK in line:
+        return True
+    return line.startswith("psql:") and (": ERROR:" in line or line.startswith("psql: error:"))
 
 
 def count_restore_errors(log_text: str) -> int:
-    """Lines reporting a pg_restore error (perl locale noise and warnings don't count)."""
-    return sum(1 for line in log_text.splitlines() if _ERROR_MARK in line)
+    """Lines reporting a pg_restore or psql error (perl locale noise and notices don't count)."""
+    return sum(1 for line in log_text.splitlines() if _is_error_line(line))
+
+
+def _unknown_column_options(line: str) -> list:
+    """Unsupported option names of an `ALTER COLUMN … SET (…)` statement line, else []."""
+    m = _COLUMN_OPTIONS_RE.fullmatch(line)
+    if not m:
+        return []
+    names = []
+    for item in m.group(1).split(", "):
+        opt = _OPTION_RE.fullmatch(item)
+        if not opt:
+            return []  # not a plain option list: leave the statement alone
+        names.append(opt.group(1))
+    return [n for n in names if n.lower() not in _CORE_COLUMN_OPTIONS]
+
+
+def filter_column_options(script: str) -> tuple:
+    """Drop column option statements the target cannot know; returns (script, {option: count}).
+
+    Every other line is kept byte for byte.
+    """
+    kept, skipped = [], {}
+    for line in io.StringIO(script, newline="\n"):
+        unknown = _unknown_column_options(line.rstrip("\r\n"))
+        if not unknown:
+            kept.append(line)
+            continue
+        for name in unknown:
+            skipped[name] = skipped.get(name, 0) + 1
+    return "".join(kept), skipped
+
+
+@contextmanager
+def _temp_dir() -> Iterator[Path]:
+    path = Path(tempfile.mkdtemp(prefix="odt_schema_"))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def inspect_dump(path, pg_restore: Optional[ToolInfo], capture=run_capture) -> DumpInfo:
@@ -203,7 +263,7 @@ class RestoreJob:
         self._register(target)
         self._refuse_unsafe(plan, confirmed_text)
         warnings: list = []
-        with self._session(target) as override:
+        with self._session(target) as override, ExitStack() as cleanup:
             if not plan.is_new:
                 busy = self._active(target, db, override)
                 if busy:
@@ -212,7 +272,9 @@ class RestoreJob:
             if not plan.dump.path.is_file():
                 raise JobError(f"Dump file not found: {plan.dump.path}")
             fs = self._prepare_filestore(plan)
-            cmds = self._build_commands(plan, override)
+            script = cleanup.enter_context(_temp_dir()) / "pre_data.sql"
+            cmds = self._build_commands(plan, override, script)
+            self._write_schema_script(plan, cmds.pre_data, script, warnings)
             if self.ctx.cancel.cancelled:
                 self.ctx.log("Cancelled before anything was changed.")
                 return RestoreOutcome("cancelled", 0, None, 0, {}, [])
@@ -248,15 +310,20 @@ class RestoreJob:
         if self.ctx.cancel.cancelled:
             _unlink(log_path)
             return self._partial(db, None, 0, warnings, "cancelled before the data restore")
-        res, error_lines, ignored = self._restore_data(plan, cmds.pg_restore, log_path, warnings)
+        reason, res, error_lines = self._restore_data(plan, cmds, log_path, warnings)
         errors = len(error_lines)
-        reason = self._hard_failure(res, ignored)
         if reason:
             return self._partial(db, log_path, errors, warnings, reason)
         if res.rc != 0 or errors:
-            self._warn(warnings, f"pg_restore finished with exit code {res.rc} and {errors} "
-                                 f"error line(s); see {log_path.name}. First ones:\n"
+            self._warn(warnings, f"Restore finished with {errors} error line(s) (pg_restore exit "
+                                 f"code {res.rc}); see {log_path.name}. First ones:\n"
                                  + "\n".join(error_lines[:5]))
+        shortfall = self._table_shortfall(target, db, plan.dump.toc, override)
+        if shortfall:
+            found, expected = shortfall
+            self._warn(warnings, f"Only {found} of {expected} tables were restored; "
+                                 f"see {log_path.name}.")
+            return self._partial(db, log_path, errors, warnings, "tables are missing")
         self._vacuum(target, db, override, warnings)
         files = self._restore_filestore(fs, warnings) if fs else 0
         if fs is None:
@@ -336,19 +403,48 @@ class RestoreJob:
             raise JobError(f"Filestore: the source {src} overlaps the destination {dest}.")
         return kind, src, dest
 
-    def _build_commands(self, plan: RestorePlan, override: PgOverride) -> _Commands:
+    def _build_commands(self, plan: RestorePlan, override: PgOverride, script: Path) -> _Commands:
         t, db = plan.target, plan.db
         b = self.builder
         return _Commands(
+            pre_data=self._cmd(b.pre_data_script, plan.dump.path, script),
             dropdb=None if plan.is_new else self._cmd(b.dropdb, t, db, pg_override=override),
             createdb=self._cmd(b.createdb, t, db, plan.owner, plan.collate, plan.ctype,
                                pg_override=override),
             extensions=[(ext, self._cmd(b.psql, t, db, f'CREATE EXTENSION IF NOT EXISTS "{ext}"',
                                         pg_override=override))
                         for ext in plan.dump.toc.extensions],
+            schema=self._cmd(b.psql_script, t, db, script, pg_override=override),
             pg_restore=self._cmd(b.pg_restore, t, db, plan.dump.path, plan.owner, plan.jobs,
-                                 pg_override=override),
+                                 sections=("data", "post-data"), pg_override=override),
         )
+
+    def _write_schema_script(self, plan: RestorePlan, cmd: Cmd, script: Path,
+                             warnings: list) -> None:
+        """Extract the pre-data script, drop unknown column options and run it as the owner.
+
+        pg_restore runs a table's CREATE and its ALTERs as one unit, so a single option the
+        target does not know (e.g. pg_attver) would lose the whole table.
+        """
+        name = plan.dump.path.name
+        self.ctx.progress(None, "Reading the schema…")
+        self.ctx.log(f"Extracting the schema of {name}")
+        rc, _out, err = self._capture(cmd, timeout=1800, redactor=self.ctx.redactor)
+        if rc != 0:
+            raise JobError(f"pg_restore could not extract the schema of {name}: "
+                           f"{self._red(last_line(err)) or f'exit {rc}'}. Nothing was changed.")
+        try:
+            text = script.read_bytes().decode("utf-8", errors="surrogateescape")
+            text, skipped = filter_column_options(text)
+            script.write_bytes(f'SET ROLE "{plan.owner}";\n{text}'
+                               .encode("utf-8", errors="surrogateescape"))
+        except OSError as exc:
+            raise JobError(f"Cannot prepare the schema script: {exc.strerror or exc}. "
+                           "Nothing was changed.") from None
+        if skipped:
+            detail = ", ".join(f"{opt} ({n})" for opt, n in sorted(skipped.items()))
+            self._warn(warnings, f"Skipped {sum(skipped.values())} column option(s) not "
+                                 f"supported by the target server: {detail}.")
 
     def _create_log(self, plan: RestorePlan) -> Path:
         path = plan.dump.path.parent / f"restore_{plan.db}_{timestamp()}.log"
@@ -384,55 +480,94 @@ class RestoreJob:
                 return ext
         return ""
 
-    def _restore_data(self, plan: RestorePlan, cmd: Cmd, log_path: Path,
+    def _restore_data(self, plan: RestorePlan, cmds: _Commands, log_path: Path,
                       warnings: list) -> tuple:
-        """Run pg_restore with its stderr in the log; returns (result, error lines, ignored).
+        """Schema script, then pg_restore data and post-data, both writing stderr to the log.
 
-        `ignored` is True when pg_restore reported that it carried on past its errors.
+        Returns (failure reason or "", pg_restore result or None, error lines).
         """
-        self.ctx.progress(None, "Restoring data…")
         self.ctx.log(f"Restoring {plan.dump.path.name} into {plan.db} (log: {log_path})")
-        log_failed = []
+        log_failed: list = []
+        results = []
         with open(log_path, "w", encoding="utf-8") as fh:
-            def on_line(line: str) -> None:
-                line = self._red(line)
-                if not log_failed:
-                    try:
-                        fh.write(line + "\n")
-                    except (OSError, ValueError) as exc:  # ValueError: line after close
-                        log_failed.append(getattr(exc, "strerror", None) or str(exc))
-                self.ctx.log(line)
-
-            res = self._run(cmd, None, on_line=on_line, cancel=self.ctx.cancel,
-                            redactor=self.ctx.redactor)
-            if res.error and not log_failed:
-                fh.write(self._red(res.error) + "\n")
+            self.ctx.progress(None, "Restoring the schema…")
+            schema, _ignored = self._run_logged(cmds.schema, fh, log_failed)
+            results.append(schema)
+            reason = self._hard_failure(schema, False, "psql", "schema restore")
+            if not reason and self.ctx.cancel.cancelled:
+                reason = "cancelled during the schema restore"
+            data = None
+            if not reason:
+                self.ctx.progress(None, "Restoring data…")
+                data, ignored = self._run_logged(cmds.pg_restore, fh, log_failed)
+                results.append(data)
+                reason = self._hard_failure(data, ignored, "pg_restore", "data restore")
         if log_failed:
             self._warn(warnings, f"Could not write all of {log_path.name}: {log_failed[0]}.")
         try:
             text = log_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            text = "\n".join(res.stderr_tail)
-        error_lines = [ln for ln in text.splitlines() if _ERROR_MARK in ln]
-        ignored = _IGNORED_MARK in text or any(_IGNORED_MARK in ln for ln in res.stderr_tail)
-        return res, error_lines, ignored
+            text = "\n".join(ln for res in results for ln in res.stderr_tail)
+        return reason, data, [ln for ln in text.splitlines() if _is_error_line(ln)]
 
-    def _hard_failure(self, res: RunResult, ignored: bool) -> str:
-        """Why pg_restore did not run to completion, or "" when it did."""
+    def _run_logged(self, cmd: Cmd, fh, log_failed: list) -> tuple:
+        """Run with stderr into the open log; returns (result, ignored).
+
+        `ignored` is True when pg_restore reported that it carried on past its errors.
+        """
+        ignored = []
+
+        def on_line(line: str) -> None:
+            line = self._red(line)
+            if _IGNORED_MARK in line:
+                ignored.append(True)
+            if not log_failed:
+                try:
+                    fh.write(line + "\n")
+                except (OSError, ValueError) as exc:  # ValueError: line after close
+                    log_failed.append(getattr(exc, "strerror", None) or str(exc))
+            self.ctx.log(line)
+
+        res = self._run(cmd, None, on_line=on_line, cancel=self.ctx.cancel,
+                        redactor=self.ctx.redactor)
+        if res.error and not log_failed:
+            fh.write(self._red(res.error) + "\n")
+        return res, bool(ignored) or any(_IGNORED_MARK in ln for ln in res.stderr_tail)
+
+    def _hard_failure(self, res: RunResult, ignored: bool, tool: str, stage: str) -> str:
+        """Why the step did not run to completion, or "" when it did."""
         if res.error:
-            return f"pg_restore could not run: {self._red(res.error)}"
+            return f"{tool} could not run: {self._red(res.error)}"
         if res.rc == 0:  # finished; a cancel that raced the exit does not undo that
             return ""
         if res.cancelled:
-            return "cancelled during the data restore"
+            return f"cancelled during the {stage}"
         if res.rc == 127:
-            return "pg_restore could not start (exit 127)"
+            return f"{tool} could not start (exit 127)"
         if res.rc < 0:
-            return f"pg_restore was killed (signal {-res.rc})"
+            return f"{tool} was killed (signal {-res.rc})"
         if not ignored:
             last = self._red(last_line(res.stderr_tail))
-            return f"pg_restore stopped with exit code {res.rc}" + (f": {last}" if last else "")
+            return f"{tool} stopped with exit code {res.rc}" + (f": {last}" if last else "")
         return ""
+
+    def _table_shortfall(self, target: Connection, db: str, toc: TocInfo,
+                         override: PgOverride) -> Optional[tuple]:
+        """(found, expected) when far fewer public tables exist than the dump has; else None."""
+        expected = toc.table_data
+        if expected <= 0:
+            return None
+        try:
+            rc, out, _err = self._psql(target, db, _TABLES_SQL, override)
+        except JobError:
+            return None
+        value = out.strip()
+        if rc != 0 or not value.isdigit():
+            return None  # unknown: the quick check shows "?"
+        found = int(value)
+        if found * 100 >= expected * _MIN_TABLES_PERCENT:
+            return None
+        return found, expected
 
     def _partial(self, db: str, log_path: Optional[Path], errors: int, warnings: list,
                  reason: str) -> RestoreOutcome:
@@ -607,3 +742,4 @@ class RestoreJob:
     def _warn(self, warnings: list, text: str) -> None:
         warnings.append(text)
         self.ctx.log(f"Warning: {text}")
+

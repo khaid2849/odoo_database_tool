@@ -574,7 +574,7 @@ class RestoreTab(QWidget):
         lines = [f"Restore incomplete: {plan.db} on {plan.target.name} is partial. It was not "
                  "neutralized and no filestore was restored."]
         if outcome.errors:
-            lines.append(f"{outcome.errors} pg_restore error line(s).")
+            lines.append(f"{outcome.errors} restore error line(s).")
         lines += [f"⚠ {w}" for w in outcome.warnings]
         self._card("resultBad", "\n".join(lines))
         self._partial = (plan.target, plan.db)

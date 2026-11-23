@@ -347,3 +347,38 @@ def test_hostname_uses_ssh_or_tunnel(builder, docker_conn, pg_conn, monkeypatch)
     pg_conn.tunnel.use_password = True
     c = builder.hostname(pg_conn)
     assert c.argv[-1] == "hostname" and c.env["ODT_ASKPASS_KEY"] == f"{pg_conn.id}:tunnel_password"
+
+
+# --- sectioned restore ----------------------------------------------------------------------
+
+def test_pg_restore_sections_are_optional(builder, local_conn, tmp_path):
+    plain = builder.pg_restore(local_conn, "db1", tmp_path / "x.dump", "odoo18", 4).argv
+    assert not any(a.startswith("--section") for a in plain)
+    r = builder.pg_restore(local_conn, "db1", tmp_path / "x.dump", "odoo18", 4,
+                           sections=("data", "post-data")).argv
+    assert "--section=data" in r and "--section=post-data" in r
+    assert "--section=pre-data" not in r
+    assert "--role=odoo18" in r and r[r.index("-d") + 1] == "db1"
+    assert r[-1] == str(tmp_path / "x.dump")
+
+
+def test_pre_data_script_needs_no_connection(builder, tmp_path):
+    cmd = builder.pre_data_script(tmp_path / "a b.dump", tmp_path / "pre.sql")
+    assert cmd.argv == ["/pg/bin/pg_restore", "--section=pre-data", "--no-owner",
+                        "--no-privileges", "-f", str(tmp_path / "pre.sql"),
+                        str(tmp_path / "a b.dump")]
+    assert not cmd.env
+
+
+def test_psql_script_continues_on_error(builder, local_conn, secrets, tmp_path):
+    secrets.set(local_conn.id, "pg_password", "pw")
+    cmd = builder.psql_script(local_conn, "db1", tmp_path / "s.sql",
+                              pg_override=("127.0.0.1", 6000))
+    a = cmd.argv
+    assert a[0] == "/pg/bin/psql" and "-X" in a and "-w" in a
+    assert a[a.index("-v") + 1] == "ON_ERROR_STOP=0"
+    assert "--single-transaction" not in a
+    assert a[a.index("-d") + 1] == "db1" and a[-2:] == ["-f", str(tmp_path / "s.sql")]
+    assert a[a.index("-p") + 1] == "6000" and cmd.env["PGPASSWORD"] == "pw"
+    with pytest.raises(ValueError):
+        builder.psql_script(local_conn, "a b", tmp_path / "s.sql")
