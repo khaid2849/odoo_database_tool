@@ -121,6 +121,21 @@ def test_restore_commands(builder, local_conn, tmp_path):
 
 # --- additional coverage ---
 
+def test_docker_odoo_conf_positional_order(builder, docker_conn):
+    docker_conn.odoo_conf_path = "/etc/odoo/odoo.conf"
+    r = builder.psql(docker_conn, "postgres", "select 1").argv[-1]
+    assert r.endswith(" sh /etc/odoo/odoo.conf postgres 'select 1'")
+    d = builder.dump_db(docker_conn, "db1").argv[-1]
+    assert d.endswith(" sh /etc/odoo/odoo.conf db1") and '-Fc -d "$1"' in d
+
+
+def test_docker_odoo_conf_leaves_host_to_socket(builder, docker_conn):
+    docker_conn.odoo_conf_path = "/etc/odoo/odoo.conf"
+    r = builder.psql(docker_conn, "postgres", "select 1").argv[-1]
+    assert "localhost" not in r and "PGPORT=${p:-5432}" in r
+    assert 'if [ -n "$h" ]; then PGHOST=$h; export PGHOST; fi' in r
+
+
 def test_docker_db_and_sql_are_positional_args(builder, docker_conn):
     r = builder.psql(docker_conn, "odoo_dev", "select 'a'").argv[-1]
     assert r.startswith("docker exec -e LC_ALL=C odoo-web-1 sh -c ")
@@ -183,6 +198,35 @@ def test_ssh_host_quotes_pg_values(builder, host_conn):
 def test_ssh_host_without_password_has_no_stdin(builder, host_conn):
     c = builder.dump_db(host_conn, "db1")
     assert c.stdin is None and "exec nice -n 10 pg_dump" in c.argv[-1]
+
+
+def test_ssh_host_pg_os_user_password_via_sudo_stdin(builder, host_conn, secrets):
+    host_conn.pg_os_user = "postgres"
+    secrets.set(host_conn.id, "pg_password", "p'a$s \"w")
+    c = builder.dump_db(host_conn, "db1")
+    assert all("p'a$s" not in a for a in c.argv) and c.stdin == b"p'a$s \"w\n"
+    assert "sudo -n -u postgres sh -c " in c.argv[-1]
+    assert c.argv[-1].endswith(" sh pg_dump -w -U odoo -Fc -d db1")
+
+
+def test_ssh_host_pg_os_user_local_host_uses_socket(builder, host_conn):
+    host_conn.pg_os_user = "postgres"
+    host_conn.pg.host = "localhost"
+    r = builder.psql(host_conn, "db1", "select 1").argv[-1]
+    assert " -h " not in r and " -p " not in r
+    host_conn.pg.port = 5433
+    assert " -p 5433 " in builder.psql(host_conn, "db1", "select 1").argv[-1]
+
+
+def test_ssh_host_pg_os_user_remote_host_keeps_h(builder, host_conn):
+    host_conn.pg_os_user = "postgres"
+    host_conn.pg.host = "10.0.0.5"
+    assert " -h 10.0.0.5 -p 5432 " in builder.psql(host_conn, "db1", "select 1").argv[-1]
+
+
+def test_kind_label_in_errors(builder, docker_conn):
+    with pytest.raises(ValueError, match="SSH \\+ Docker"):
+        builder.dropdb(docker_conn, "db1")
 
 
 def test_ssh_host_rejects_bad_pg_os_user(builder, host_conn):

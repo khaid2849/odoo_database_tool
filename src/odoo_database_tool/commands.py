@@ -17,20 +17,26 @@ from .ssh import Cmd, ssh_cmd
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ENV_KEYS = ("host", "port", "user", "password")
 _NICE = "nice -n 10 "
+_LOCAL_HOSTS = ("", "localhost", "127.0.0.1", "::1")
+_KIND_LABELS = {Kind.SSH_DOCKER: "SSH + Docker", Kind.SSH_HOST: "SSH + host Postgres",
+                Kind.POSTGRES: "Direct Postgres", Kind.LOCAL: "Local Postgres"}
 
 # odoo.conf fallback: $1 is the conf path; exports libpq env vars, then shifts so the
-# tool arguments see the same positionals as in env-name mode. "False" means unset.
+# tool arguments see the same positionals as in env-name mode. "False" means unset;
+# no db_host leaves PGHOST unset so libpq uses the socket, as Odoo does.
 _CONF_PRELUDE = (
     'c=$1; shift; '
     'v() { x=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$c" | tail -n 1'
     ' | sed "s/[[:space:]]*\\$//"); [ "$x" = False ] || printf %s "$x"; }; '
     'h=$(v db_host); p=$(v db_port); u=$(v db_user); w=$(v db_password); '
-    'PGHOST=${h:-localhost}; PGPORT=${p:-5432}; export PGHOST PGPORT; '
+    'PGPORT=${p:-5432}; export PGPORT; '
+    'if [ -n "$h" ]; then PGHOST=$h; export PGHOST; fi; '
     'if [ -n "$u" ]; then PGUSER=$u; export PGUSER; fi; '
     'if [ -n "$w" ]; then PGPASSWORD=$w; export PGPASSWORD; fi; '
 )
 _STATS_SCRIPT = 'cd "$1/$2" && find . -type f | wc -l && du -sk . | cut -f1'
 _READ_PASSWORD = "IFS= read -r PGPASSWORD; export PGPASSWORD; "
+_EXEC_ARGS = _READ_PASSWORD + 'exec "$@"'
 
 
 def _q(value) -> str:
@@ -43,6 +49,8 @@ def _sh_c(script: str, args: list[str]) -> str:
 
 
 class CommandBuilder:
+    """`pg_override` (tunnel host/port) only applies to POSTGRES/LOCAL connections."""
+
     def __init__(self, settings, secrets, ssh_bin: str):
         self.settings = settings
         self.secrets = secrets
@@ -72,7 +80,7 @@ class CommandBuilder:
         if conn.kind == Kind.SSH_DOCKER:
             return self._docker_pg(conn, "psql", '-X -d "$1" -Atc "$2"', [db, sql])
         if conn.kind == Kind.SSH_HOST:
-            return self._host_pg(conn, "psql", f"-X -d {db} -Atc {_q(sql)}")
+            return self._host_pg(conn, "psql", ["-X", "-d", db, "-Atc", sql])
         return self._local_pg(conn, "psql", ["-X", "-d", db, "-Atc", sql], pg_override)
 
     def pg_dump_version(self, conn: Connection) -> Cmd:
@@ -88,7 +96,7 @@ class CommandBuilder:
         if conn.kind == Kind.SSH_DOCKER:
             return self._docker_pg(conn, "pg_dump", '-Fc -d "$1"', [db], nice=True)
         if conn.kind == Kind.SSH_HOST:
-            return self._host_pg(conn, "pg_dump", f"-Fc -d {db}", nice=True)
+            return self._host_pg(conn, "pg_dump", ["-Fc", "-d", db], nice=True)
         return self._local_pg(conn, "pg_dump", ["-Fc", "-d", db], pg_override)
 
     def filestore_stats(self, conn: Connection, db: str) -> Cmd:
@@ -147,7 +155,7 @@ class CommandBuilder:
     @staticmethod
     def _require(conn: Connection, *kinds: Kind) -> None:
         if conn.kind not in kinds:
-            raise ValueError(f"Not supported for a {conn.kind.value} connection.")
+            raise ValueError(f"Not supported for a {_KIND_LABELS[conn.kind]} connection.")
 
     def _ssh(self, conn: Connection, remote: str, stdin: bytes | None = None) -> Cmd:
         return ssh_cmd(self.ssh_bin, conn.ssh, remote, conn_id=conn.id, stdin=stdin)
@@ -195,17 +203,28 @@ class CommandBuilder:
                 raise ValueError(f"Invalid environment variable name for {key}: {value!r}")
         return names
 
-    def _host_pg(self, conn: Connection, tool: str, tool_args: str, nice: bool = False) -> Cmd:
+    def _host_pg(self, conn: Connection, tool: str, args: list[str], nice: bool = False) -> Cmd:
         """Postgres tool on the SSH host; a stored password is fed through stdin."""
         pg = conn.pg
-        endpoint = (f" -h {_q(pg.host)}" if pg.host else "") + f" -p {int(pg.port)}"
-        if pg.user:
-            endpoint += f" -U {_q(pg.user)}"
         sudo = self._pg_sudo(conn)
-        # sudo resets the environment, so peer-auth (OS user) setups get no password.
-        password = None if sudo or pg.no_password else self.secrets.get(conn.id, "pg_password")
-        remote = (f"{_READ_PASSWORD if password else ''}exec {_NICE if nice else ''}"
-                  f"{sudo}{tool} -w{endpoint} {tool_args}")
+        argv = [tool, "-w"]
+        # Peer auth as an OS user needs the Unix socket: drop a loopback/socket host.
+        socket = bool(sudo) and (pg.host.strip() in _LOCAL_HOSTS or pg.host.startswith("/"))
+        if pg.host and not socket:
+            argv += ["-h", pg.host]
+        if not (socket and int(pg.port) == 5432):
+            argv += ["-p", str(int(pg.port))]
+        if pg.user:
+            argv += ["-U", pg.user]
+        command = " ".join(_q(a) for a in argv + args)
+        password = None if pg.no_password else self.secrets.get(conn.id, "pg_password")
+        nice_ = _NICE if nice else ""
+        if not password:
+            remote = f"exec {nice_}{sudo}{command}"
+        elif sudo:  # sudo resets the environment, so read the password after it
+            remote = f"exec {nice_}{sudo}sh -c {_q(_EXEC_ARGS)} sh {command}"
+        else:
+            remote = f"{_READ_PASSWORD}exec {nice_}{command}"
         return self._ssh(conn, remote, (password + "\n").encode() if password else None)
 
     def _local_pg(self, conn: Connection, tool: str, args: list[str], pg_override) -> Cmd:
