@@ -15,7 +15,7 @@ from odoo_database_tool.jobs import JobContext, JobError
 from odoo_database_tool.models import Connection, Kind, SshTarget
 from odoo_database_tool.restore import (Activity, DumpInfo, RestoreJob, RestorePlan,
                                         count_restore_errors, filter_column_options,
-                                        inspect_dump)
+                                        find_psql_meta_command, inspect_dump)
 from odoo_database_tool.runner import CancelToken, Redactor, RunResult
 from odoo_database_tool.store import Secrets
 from odoo_database_tool.tools import ToolInfo
@@ -383,14 +383,17 @@ def test_execute_happy_path_order(secrets, ctx, local_conn, dump_file):
     steps = [s for s in tool_order(events) if s != "psql"]  # drop the read-only queries
     assert steps == ["pg_restore pre-data", "dropdb", "createdb", "psql CREATE EXTENSION vector",
                      "psql script", "pg_restore", "vacuumdb"]
-    assert tool_order(events)[0] == "psql"  # active-connections check runs first
+    # the schema script is extracted first, so the connections check stays next to dropdb
+    assert tool_order(events)[:2] == ["pg_restore pre-data", "psql"]
+    assert "pg_stat_activity" in events[1]
     create = run.called("createdb")[0]
     assert "-T template0 -E UTF8 --lc-collate=C --lc-ctype=C -O odoo mydb" in create
     pre = cap.called("--section=pre-data")[0]
     assert pre.startswith("/pg/bin/pg_restore --section=pre-data --no-owner --no-privileges -f ")
     assert pre.endswith(f" {dump_file}") and " -d " not in pre
     schema = run.called("ON_ERROR_STOP=0")[0]
-    assert "-X -v ON_ERROR_STOP=0 -d mydb -f " in schema and "--single-transaction" not in schema
+    assert "-X -b -v ON_ERROR_STOP=0 -d mydb -f " in schema
+    assert "--single-transaction" not in schema
     restore = run.called("--section=data")[0]
     assert (f"--section=data --section=post-data --no-owner --no-privileges --role=odoo "
             f"-j 4 -d mydb {dump_file}") in restore
@@ -1023,8 +1026,10 @@ def test_count_restore_errors_counts_psql_errors():
     assert count_restore_errors(log) == 2
 
 
-def toc_with_tables(n):
+def toc_with_tables(n, other=0):
     rows = "".join(f"{10 + i}; 0 {20000 + i} TABLE DATA public t{i} odoo\n" for i in range(n))
+    rows += "".join(f"{9000 + i}; 0 {30000 + i} TABLE DATA audit a{i} odoo\n"
+                    for i in range(other))
     return TOC_EMPTY + rows
 
 
@@ -1063,3 +1068,66 @@ def test_table_shortfall_threshold(secrets, ctx, local_conn, dump_file, tables, 
     outcome = job.execute(make_plan(dump_file, local_conn, toc=toc_with_tables(2959)))
     assert outcome.status == status
     assert bool(run.called("vacuumdb")) == (status == "ok")
+
+
+def test_shortfall_ignores_tables_outside_public(secrets, ctx, local_conn, dump_file):
+    events = []
+    cap = FakeCapture(events, pg_tables=(0, "2\n", ""))
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn, toc=toc_with_tables(2, other=100)))
+    assert outcome.status == "ok" and run.called("vacuumdb")
+
+
+def test_shortfall_counts_only_public_table_data(secrets, ctx, local_conn, dump_file):
+    events = []
+    cap = FakeCapture(events, pg_tables=(0, "2\n", ""))
+    job, _, _, _ = make_job(secrets, ctx, capture=cap, events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn, toc=toc_with_tables(10, other=5)))
+    assert outcome.status == "partial"
+    assert f"Only 2 of 10 tables were restored; see {outcome.log_path.name}." in outcome.warnings
+
+
+# --- psql meta-commands in the schema script -------------------------------------------------
+
+def test_find_psql_meta_command():
+    allowed = "SET x = 1;\n\\restrict AbC123\nSELECT 1;\n\\unrestrict AbC123\n"
+    assert find_psql_meta_command(allowed) == 0
+    assert find_psql_meta_command("SELECT 'a\\b';\nSELECT 1;\n") == 0
+    assert find_psql_meta_command("SET x = 1;\n-- Name: x\n\\! touch /tmp/x\n") == 3
+    assert find_psql_meta_command("SELECT 1;\n   \\copy t from program 'x'\n") == 2
+    assert find_psql_meta_command("\\restrict\n") == 1  # a key is required
+    assert find_psql_meta_command("\\restrict k extra\n") == 1
+
+
+@pytest.mark.parametrize("bad", ["\\! touch x\n", "  \\! touch x\n", "\\i /etc/passwd\n"])
+def test_meta_command_in_schema_refuses_before_anything(secrets, ctx, local_conn, dump_file,
+                                                        bad):
+    events = []
+    cap = FakeCapture(events, **{"--section=pre-data": writes_script(
+        "-- Name: evil\n" + bad + PRE_DATA)})
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    with pytest.raises(JobError) as exc:
+        job.execute(make_plan(dump_file, local_conn))
+    # line 1 is the prepended SET ROLE, line 2 the comment
+    assert str(exc.value) == ("The schema script contains psql meta-commands (line 3); refusing "
+                              "to run it. Nothing was changed.")
+    assert run.calls == [] and not cap.called("pg_stat_activity")
+    assert not list(dump_file.parent.glob("restore_*.log"))
+    assert not file_arg_from(cap.called("--section=pre-data")[0]).parent.exists()
+
+
+def test_restrict_meta_commands_are_allowed(secrets, ctx, local_conn, dump_file):
+    events = []
+    body = "\\restrict k3Y\n" + PRE_DATA + "\\unrestrict k3Y\n"
+    cap = FakeCapture(events, **{"--section=pre-data": writes_script(body)})
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    assert outcome.status == "ok"
+    assert list(run.scripts_seen.values()) == ['SET ROLE "odoo";\n' + body]
+
+
+def test_log_notes_the_line_offset(secrets, ctx, local_conn, dump_file):
+    job, _, _, _ = make_job(secrets, ctx)
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    first = outcome.log_path.read_text().splitlines()[0]
+    assert first == "Schema script line numbers are +1 (SET ROLE prepended)"

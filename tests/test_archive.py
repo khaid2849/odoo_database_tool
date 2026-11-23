@@ -28,14 +28,22 @@ def test_parse_toc_sample():
     assert info.dumped_from == "17.12 (Ubuntu 17.12-1.pgdg24.04+1)"
     assert info.dumped_by == "17.4 (Ubuntu 17.4-1.pgdg24.04+2)"
     assert info.entries == 9
-    assert info.table_data == 3
+    assert info.table_data == 3 and info.public_table_data == 3
     assert info.extensions == ["vector"]
+
+
+def test_parse_toc_counts_public_table_data_separately():
+    info = parse_toc("5; 0 1 TABLE DATA public a odoo\n"
+                     "6; 0 2 TABLE DATA audit log odoo\n"
+                     "7; 0 3 TABLE DATA publicity b odoo\n")
+    assert info.table_data == 3 and info.public_table_data == 1
 
 
 def test_parse_toc_empty():
     info = parse_toc("")
     assert info.dumped_from is None and info.dumped_by is None
     assert info.entries == 0 and info.table_data == 0 and info.extensions == []
+    assert info.public_table_data == 0
 
 
 def test_filenames():

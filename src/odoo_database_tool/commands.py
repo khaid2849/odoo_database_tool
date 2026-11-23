@@ -165,7 +165,7 @@ class CommandBuilder:
     def psql_script(self, conn: Connection, db: str, sql_file: Path, *, pg_override=None) -> Cmd:
         """Run a script statement by statement, carrying on past errors like pg_restore."""
         validate_identifier(db, "database name")
-        args = ["-X", "-v", "ON_ERROR_STOP=0", "-d", db, "-f", str(sql_file)]
+        args = ["-X", "-b", "-v", "ON_ERROR_STOP=0", "-d", db, "-f", str(sql_file)]
         return self._local_pg(conn, "psql", args, pg_override)
 
     # --- helpers -----------------------------------------------------------------

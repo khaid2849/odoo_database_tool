@@ -44,6 +44,9 @@ _IDENT = r'(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")+")'
 _COLUMN_OPTIONS_RE = re.compile(
     rf"ALTER TABLE (?:ONLY )?{_IDENT}(?:\.{_IDENT})? ALTER COLUMN {_IDENT} SET \((.+)\);")
 _OPTION_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=[^\s,()=';]+")
+# pg_restore 17.6+/18 brackets its scripts with these; any other meta-command could run code.
+_ALLOWED_META_RE = re.compile(r"\s*\\(?:un)?restrict [A-Za-z0-9]+\s*")
+_OWNER_PREFIX_NOTE = "Schema script line numbers are +1 (SET ROLE prepended)"
 
 PgOverride = Optional[Tuple[str, int]]
 
@@ -141,6 +144,17 @@ def filter_column_options(script: str) -> tuple:
         for name in unknown:
             skipped[name] = skipped.get(name, 0) + 1
     return "".join(kept), skipped
+
+
+def find_psql_meta_command(script: str) -> int:
+    """1-based number of the first line starting with a backslash, or 0.
+
+    Only `\\restrict <key>` / `\\unrestrict <key>` lines are allowed.
+    """
+    for number, line in enumerate(script.split("\n"), 1):
+        if line.lstrip().startswith("\\") and not _ALLOWED_META_RE.fullmatch(line.rstrip("\r")):
+            return number
+    return 0
 
 
 @contextmanager
@@ -264,17 +278,18 @@ class RestoreJob:
         self._refuse_unsafe(plan, confirmed_text)
         warnings: list = []
         with self._session(target) as override, ExitStack() as cleanup:
-            if not plan.is_new:
-                busy = self._active(target, db, override)
-                if busy:
-                    raise JobError(self._busy_message(db, busy))
-            self._check_owner(target, plan.owner, override)
             if not plan.dump.path.is_file():
                 raise JobError(f"Dump file not found: {plan.dump.path}")
             fs = self._prepare_filestore(plan)
             script = cleanup.enter_context(_temp_dir()) / "pre_data.sql"
             cmds = self._build_commands(plan, override, script)
+            # The slow local extraction goes first so the checks below stay close to dropdb.
             self._write_schema_script(plan, cmds.pre_data, script, warnings)
+            if not plan.is_new:
+                busy = self._active(target, db, override)
+                if busy:
+                    raise JobError(self._busy_message(db, busy))
+            self._check_owner(target, plan.owner, override)
             if self.ctx.cancel.cancelled:
                 self.ctx.log("Cancelled before anything was changed.")
                 return RestoreOutcome("cancelled", 0, None, 0, {}, [])
@@ -436,8 +451,13 @@ class RestoreJob:
         try:
             text = script.read_bytes().decode("utf-8", errors="surrogateescape")
             text, skipped = filter_column_options(text)
-            script.write_bytes(f'SET ROLE "{plan.owner}";\n{text}'
-                               .encode("utf-8", errors="surrogateescape"))
+            text = f'SET ROLE "{plan.owner}";\n{text}'
+            # Names with newlines can smuggle psql meta-commands (CVE-2025-8714 class).
+            line = find_psql_meta_command(text)
+            if line:
+                raise JobError(f"The schema script contains psql meta-commands (line {line}); "
+                               "refusing to run it. Nothing was changed.")
+            script.write_bytes(text.encode("utf-8", errors="surrogateescape"))
         except OSError as exc:
             raise JobError(f"Cannot prepare the schema script: {exc.strerror or exc}. "
                            "Nothing was changed.") from None
@@ -491,6 +511,8 @@ class RestoreJob:
         results = []
         with open(log_path, "w", encoding="utf-8") as fh:
             self.ctx.progress(None, "Restoring the schema…")
+            fh.write(_OWNER_PREFIX_NOTE + "\n")
+            self.ctx.log(_OWNER_PREFIX_NOTE)
             schema, _ignored = self._run_logged(cmds.schema, fh, log_failed)
             results.append(schema)
             reason = self._hard_failure(schema, False, "psql", "schema restore")
@@ -554,7 +576,7 @@ class RestoreJob:
     def _table_shortfall(self, target: Connection, db: str, toc: TocInfo,
                          override: PgOverride) -> Optional[tuple]:
         """(found, expected) when far fewer public tables exist than the dump has; else None."""
-        expected = toc.table_data
+        expected = toc.public_table_data
         if expected <= 0:
             return None
         try:
@@ -742,4 +764,3 @@ class RestoreJob:
     def _warn(self, warnings: list, text: str) -> None:
         warnings.append(text)
         self.ctx.log(f"Warning: {text}")
-

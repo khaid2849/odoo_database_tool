@@ -376,7 +376,7 @@ def test_psql_script_continues_on_error(builder, local_conn, secrets, tmp_path):
                               pg_override=("127.0.0.1", 6000))
     a = cmd.argv
     assert a[0] == "/pg/bin/psql" and "-X" in a and "-w" in a
-    assert a[a.index("-v") + 1] == "ON_ERROR_STOP=0"
+    assert a[a.index("-v") + 1] == "ON_ERROR_STOP=0" and "-b" in a  # failing SQL in the log
     assert "--single-transaction" not in a
     assert a[a.index("-d") + 1] == "db1" and a[-2:] == ["-f", str(tmp_path / "s.sql")]
     assert a[a.index("-p") + 1] == "6000" and cmd.env["PGPASSWORD"] == "pw"

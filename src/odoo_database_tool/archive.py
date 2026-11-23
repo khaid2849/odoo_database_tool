@@ -24,12 +24,13 @@ class TocInfo:
     entries: int
     table_data: int
     extensions: list[str]
+    public_table_data: int = 0  # TABLE DATA entries in schema public
 
 
 def parse_toc(text: str) -> TocInfo:
     """Summarise the output of `pg_restore -l`."""
     dumped_from = dumped_by = None
-    entries = table_data = 0
+    entries = table_data = public_table_data = 0
     extensions: list[str] = []
     for line in text.splitlines():
         if line.startswith(";"):
@@ -43,10 +44,12 @@ def parse_toc(text: str) -> TocInfo:
             entries += 1
             if re.match(r"^\d+; \d+ \d+ TABLE DATA ", line):
                 table_data += 1
+                if re.match(r"^\d+; \d+ \d+ TABLE DATA public ", line):
+                    public_table_data += 1
             m = re.match(r"^\d+; \d+ \d+ EXTENSION - (\S+)", line)
             if m:
                 extensions.append(m.group(1))
-    return TocInfo(dumped_from, dumped_by, entries, table_data, extensions)
+    return TocInfo(dumped_from, dumped_by, entries, table_data, extensions, public_table_data)
 
 
 def dump_filename(db: str, conn_name: str, now: datetime | None = None) -> str:
