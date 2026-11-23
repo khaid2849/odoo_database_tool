@@ -203,6 +203,8 @@ def run_stream(
 
     rc = proc.wait()
     err_thread.join(5)
+    proc.stdout.close()
+    proc.stderr.close()
     if on_bytes and total != reported:
         on_bytes(total)
     return RunResult(
