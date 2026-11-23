@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import tarfile
 from pathlib import Path
 
@@ -93,7 +94,8 @@ def test_extract_strips_top(tmp_path, name, mode):
     assert (dest / "0a" / "f1").read_bytes() == b"abc"
     assert (dest / "ff" / "f2").read_bytes() == b"zz"
     assert not (dest / "odoo_src").exists()
-    assert (dest / "0a" / "f1").stat().st_mode & 0o777 == 0o644
+    if os.name != "nt":  # Windows only has a read-only flag, not POSIX mode bits
+        assert (dest / "0a" / "f1").stat().st_mode & 0o777 == 0o644
 
 
 @pytest.mark.parametrize("bad", ["top/../../evil", "/abs/evil", "top/a/../../../evil", "top/.."])

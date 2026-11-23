@@ -199,7 +199,7 @@ def test_success_lists_files_warnings_and_opens_folder(env, tmp_path):
     assert tab.result.objectName() == "resultOk"
     assert "shop.dump" in text and "2.0 KB" in text and "stale filestore" in text
     tab.open_button.click()
-    assert opened[0].toLocalFile() == str(tmp_path)
+    assert Path(opened[0].toLocalFile()) == tmp_path
 
 
 def test_failure_shows_error_in_red_box(env):

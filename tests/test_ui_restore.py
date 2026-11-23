@@ -495,7 +495,7 @@ def test_ok_neutralize_accepted_shows_status_and_quick_check(env):
     text = card_text(env.tab)
     assert "Neutralized (Odoo 18.0, 2 files)" in text
     assert NOT_NEUTRALIZED not in text
-    for part in ("2.0 MB", "812", "120", "/dumps/restore_shop.log", "57", "old filestore kept",
+    for part in ("2.0 MB", "812", "120", str(Path("/dumps/restore_shop.log")), "57", "old filestore kept",
                  "True"):
         assert part in text
     assert "2 error" in text
