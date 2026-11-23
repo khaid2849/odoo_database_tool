@@ -44,6 +44,7 @@ def resolve_filestore_source(p: Path) -> Tuple[str, Path]:
 
 
 def filestore_target(root: Path, db: str) -> Path:
+    """Return root/db after validating the database name."""
     return Path(root) / validate_identifier(db, "database name")
 
 
@@ -64,30 +65,19 @@ def _strip_name(name: str) -> str:
     return "/".join(parts[1:])
 
 
-def _inside(rel: str) -> bool:
-    return rel != ".." and not rel.startswith("../") and not posixpath.isabs(rel)
-
-
-def _check_link(member: tarfile.TarInfo, rel: str) -> str:
-    """Return the link target relative to dest, rejecting anything outside it."""
-    link = member.linkname
-    if link.startswith("/") or "\\" in link:
-        raise ValueError(f"Link escapes destination: {member.name!r} -> {link!r}")
-    if member.issym():
-        target = posixpath.normpath(posixpath.join(posixpath.dirname(rel), link))
-    else:
-        target = _strip_name(link)
-        if not target:
-            raise ValueError(f"Link escapes destination: {member.name!r} -> {link!r}")
-        target = posixpath.normpath(target)
-    if not _inside(target):
-        raise ValueError(f"Link escapes destination: {member.name!r} -> {link!r}")
-    return target
-
-
-def _ensure_inside(dest_real: Path, path: Path) -> None:
-    if os.path.commonpath([dest_real, Path(os.path.realpath(path))]) != str(dest_real):
-        raise ValueError(f"Refusing to write outside destination: {path}")
+def _safe_output(dest_real: Path, rel: str) -> Path:
+    """Validate rel against dest before anything is created; refuse symlinks on the way."""
+    cur = dest_real
+    for part in rel.split("/"):
+        cur = cur / part
+        if cur.is_symlink():
+            raise ValueError(f"Refusing to write through a symlink: {cur}")
+    anc = cur
+    while not os.path.lexists(anc):
+        anc = anc.parent
+    if os.path.commonpath([dest_real, Path(os.path.realpath(anc))]) != str(dest_real):
+        raise ValueError(f"Refusing to write outside destination: {cur}")
+    return cur
 
 
 def extract_tar_strip(archive: Path, dest: Path,
@@ -104,36 +94,19 @@ def extract_tar_strip(archive: Path, dest: Path,
                 if m.isdir():
                     continue
                 raise ValueError(f"Unsafe empty path in archive: {m.name!r}")
-            if not (m.isreg() or m.isdir() or m.issym() or m.islnk()):
+            if m.issym() or m.islnk():
+                raise ValueError("links are not allowed in a filestore archive")
+            if not (m.isreg() or m.isdir()):
                 raise ValueError(f"Unsupported member type in archive: {m.name!r}")
-            out = dest / rel
+            out = _safe_output(dest_real, rel)
             if m.isdir():
-                _ensure_inside(dest_real, out)
                 out.mkdir(parents=True, exist_ok=True)
                 os.chmod(out, 0o755)
                 continue
-            link_target = _check_link(m, rel) if (m.issym() or m.islnk()) else None
             out.parent.mkdir(parents=True, exist_ok=True)
-            _ensure_inside(dest_real, out.parent)
-            if m.issym():
-                if out.is_symlink() or out.exists():
-                    out.unlink()
-                os.symlink(m.linkname, out)
-            elif m.islnk():
-                src = dest / link_target
-                if not src.is_file():
-                    raise ValueError(f"Hard link target not extracted: {m.name!r}")
-                if out.exists() or out.is_symlink():
-                    out.unlink()
-                shutil.copyfile(src, out)
-                os.chmod(out, 0o644)
-            else:
-                if out.is_symlink():
-                    out.unlink()
-                src_f = tf.extractfile(m)
-                with open(out, "wb") as fh:
-                    shutil.copyfileobj(src_f, fh, _CHUNK)
-                os.chmod(out, 0o644)
+            with open(out, "wb") as fh:
+                shutil.copyfileobj(tf.extractfile(m), fh, _CHUNK)
+            os.chmod(out, 0o644)
             count += 1
             if on_file:
                 on_file(count)
@@ -141,6 +114,7 @@ def extract_tar_strip(archive: Path, dest: Path,
 
 
 def count_files(p: Path) -> int:
+    """Count files under p (0 if missing)."""
     p = Path(p)
     if not p.is_dir():
         return 0
@@ -148,15 +122,19 @@ def count_files(p: Path) -> int:
 
 
 def copy_tree(src: Path, dest: Path, on_file: Optional[Callable[[int], None]] = None) -> int:
-    """Copy a folder's files into dest (created if needed); returns files copied."""
+    """Copy a folder into dest (symlinks skipped, empty dirs kept); returns files copied."""
     src, dest = Path(src), Path(dest)
     count = 0
     dest.mkdir(parents=True, exist_ok=True)
     for dirpath, dirnames, files in os.walk(src):
+        dirnames[:] = [d for d in dirnames if not (Path(dirpath) / d).is_symlink()]
         rel = Path(dirpath).relative_to(src)
         (dest / rel).mkdir(parents=True, exist_ok=True)
         for name in files:
-            shutil.copyfile(Path(dirpath) / name, dest / rel / name)
+            f = Path(dirpath) / name
+            if f.is_symlink():
+                continue
+            shutil.copyfile(f, dest / rel / name)
             count += 1
             if on_file:
                 on_file(count)
@@ -166,7 +144,7 @@ def copy_tree(src: Path, dest: Path, on_file: Optional[Callable[[int], None]] = 
 def tar_directory(root: Path, db: str, out: Path, gzip: bool,
                   on_bytes: Optional[Callable[[int], None]] = None,
                   cancel: Optional[CancelToken] = None) -> int:
-    """Tar <root>/<db> into out with top folder <db>; returns the file count."""
+    """Tar <root>/<db> into out with top folder <db> (symlinks skipped); returns the file count."""
     validate_identifier(db, "database name")
     base = Path(root) / db
     if not base.is_dir():
@@ -174,11 +152,12 @@ def tar_directory(root: Path, db: str, out: Path, gzip: bool,
     out = Path(out)
     total = 0
     count = 0
+    tf = tarfile.open(out, "w:gz" if gzip else "w")
     try:
-        with tarfile.open(out, "w:gz" if gzip else "w") as tf:
+        with tf:
             tf.add(base, arcname=db, recursive=False)
             for dirpath, dirnames, files in os.walk(base):
-                dirnames.sort()
+                dirnames[:] = sorted(d for d in dirnames if not (Path(dirpath) / d).is_symlink())
                 rel = Path(dirpath).relative_to(base)
                 for d in dirnames:
                     tf.add(Path(dirpath) / d, arcname=posixpath.join(db, *rel.parts, d), recursive=False)
@@ -186,13 +165,12 @@ def tar_directory(root: Path, db: str, out: Path, gzip: bool,
                     if cancel is not None and cancel.cancelled:
                         raise InterruptedError("Cancelled")
                     path = Path(dirpath) / name
+                    if path.is_symlink():
+                        continue
                     info = tf.gettarinfo(str(path), arcname=posixpath.join(db, *rel.parts, name))
-                    if not info.isreg():
-                        tf.addfile(info)
-                    else:
-                        with open(path, "rb") as fh:
-                            tf.addfile(info, fh)
-                        total += info.size
+                    with open(path, "rb") as fh:
+                        tf.addfile(info, fh)
+                    total += info.size
                     count += 1
                     if on_bytes:
                         on_bytes(total)

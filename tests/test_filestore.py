@@ -98,14 +98,14 @@ def test_extract_strips_top(tmp_path, name, mode):
 
 @pytest.mark.parametrize("bad", ["top/../../evil", "/abs/evil", "top/a/../../../evil", "top/.."])
 def test_extract_rejects_bad_paths(tmp_path, bad):
-    a = tmp_path / "bad.tar"
+    work = tmp_path / "work"
+    work.mkdir()
+    a = work / "bad.tar"
     make_tar(a, [("top/ok", b"1"), (bad, b"x")])
-    dest = tmp_path / "work" / "dest"
+    before = snapshot(tmp_path, work / "dest")
     with pytest.raises(ValueError):
-        fs.extract_tar_strip(a, dest)
-    assert not (tmp_path / "evil").exists()
-    assert not (tmp_path / "work" / "evil").exists()
-    assert not (tmp_path / "abs").exists()
+        fs.extract_tar_strip(a, work / "dest")
+    assert snapshot(tmp_path, work / "dest") == before
 
 
 def test_extract_rejects_empty_stripped(tmp_path):
@@ -122,29 +122,87 @@ def _special(name, typ, linkname=""):
     return ti
 
 
+def snapshot(root: Path, exclude: Path):
+    return {p for p in root.rglob("*") if exclude not in p.parents and p != exclude}
+
+
 @pytest.mark.parametrize(
     "typ,link",
     [
         (tarfile.SYMTYPE, "../../outside"),
+        (tarfile.SYMTYPE, "f1"),
         (tarfile.LNKTYPE, "../outside"),
-        (tarfile.SYMTYPE, "/etc/passwd"),
+        (tarfile.LNKTYPE, "top/f1"),
         (tarfile.CHRTYPE, ""),
         (tarfile.FIFOTYPE, ""),
     ],
 )
 def test_extract_rejects_links_and_devices(tmp_path, typ, link):
-    a = tmp_path / "s.tar"
-    make_tar(a, [("x", _special("top/special", typ, link))])
+    work = tmp_path / "work"
+    work.mkdir()
+    a = work / "s.tar"
+    make_tar(a, [("top/f1", b"1"), ("x", _special("top/special", typ, link))])
+    before = snapshot(tmp_path, work / "dest")
     with pytest.raises(ValueError):
-        fs.extract_tar_strip(a, tmp_path / "d")
-    assert not (tmp_path / "d" / "special").exists()
+        fs.extract_tar_strip(a, work / "dest")
+    assert snapshot(tmp_path, work / "dest") == before
 
 
-def test_extract_allows_inside_symlink(tmp_path):
-    a = tmp_path / "ok.tar"
-    make_tar(a, [("top/0a/f1", b"q"), ("x", _special("top/0a/link", tarfile.SYMTYPE, "f1"))])
-    fs.extract_tar_strip(a, tmp_path / "d")
-    assert (tmp_path / "d" / "0a" / "link").is_symlink()
+def test_extract_refuses_preexisting_symlink_in_dest(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "link").symlink_to(outside, target_is_directory=True)
+    a = tmp_path / "a.tar"
+    make_tar(a, [("top/link/new/f", b"x")])
+    before = snapshot(tmp_path, dest)
+    with pytest.raises(ValueError):
+        fs.extract_tar_strip(a, dest)
+    assert snapshot(tmp_path, dest) == before
+    assert list(outside.iterdir()) == []
+
+
+def test_copy_skips_symlinks_keeps_empty_dirs(tmp_path):
+    src = make_store(tmp_path / "s")
+    (src / "empty").mkdir()
+    outside = tmp_path / "outdir"
+    outside.mkdir()
+    (outside / "secret").write_bytes(b"s")
+    (src / "linkdir").symlink_to(outside, target_is_directory=True)
+    (src / "0a" / "linkfile").symlink_to(outside / "secret")
+    dest = tmp_path / "copy"
+    assert fs.copy_tree(src, dest) == 3
+    assert (dest / "empty").is_dir()
+    assert not (dest / "linkdir").exists() and not (dest / "linkdir").is_symlink()
+    assert not (dest / "0a" / "linkfile").is_symlink() and not (dest / "0a" / "linkfile").exists()
+
+
+def test_tar_skips_symlinks(tmp_path):
+    root = tmp_path / "root"
+    base = make_store(root, "mydb")
+    outside = tmp_path / "outdir"
+    outside.mkdir()
+    (outside / "secret").write_bytes(b"s")
+    (base / "linkdir").symlink_to(outside, target_is_directory=True)
+    (base / "0a" / "linkfile").symlink_to(outside / "secret")
+    out = tmp_path / "o.tar"
+    assert fs.tar_directory(root, "mydb", out, False) == 3
+    with tarfile.open(out) as tf:
+        assert not any("link" in n for n in tf.getnames())
+
+
+def test_tar_open_failure_keeps_existing_out(tmp_path):
+    root = tmp_path / "root"
+    make_store(root, "mydb")
+    out = tmp_path / "nodir" / "o.tar"
+    with pytest.raises(OSError):
+        fs.tar_directory(root, "mydb", out, False)
+    keep = tmp_path / "keep"
+    keep.mkdir()
+    with pytest.raises(OSError):
+        fs.tar_directory(root, "mydb", keep, False)  # a directory: open fails
+    assert keep.is_dir()
 
 
 def test_copy_and_count(tmp_path):
