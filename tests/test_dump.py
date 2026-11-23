@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import tarfile
 from collections import namedtuple
 from pathlib import Path
@@ -154,6 +155,11 @@ def plenty_of_space(monkeypatch):
     monkeypatch.setattr(dump_mod.shutil, "disk_usage", lambda p: Usage(10**12, 0, 10**12))
 
 
+@pytest.fixture(autouse=True)
+def reset_tunnels():
+    FakeTunnel.opened.clear()
+
+
 @pytest.fixture
 def docker_conn():
     c = Connection.new("Prod Server", Kind.SSH_DOCKER)
@@ -297,8 +303,8 @@ def test_dump_success_writes_file_sums_manifest(secrets, ctx, docker_conn, tmp_p
     assert man["odoo_version"] == "18.0.1.3"
     assert man["size"] == len(DUMP_BYTES) and man["sha256"] == sha256_file(out)
     assert cap.called("pg_restore -l")
-    assert any(text.startswith("Dumping database… ") and pct is None
-               for pct, text in ctx.events["progress"])
+    assert any(re.fullmatch(r"Dumping database… [\d.]+ [KMG]?B \(\d+m \d\ds\)", text)
+               and pct is None for pct, text in ctx.events["progress"])
     assert result.warnings == []
 
 
@@ -349,7 +355,6 @@ def test_secrets_registered_in_redactor(secrets, ctx, tmp_path):
 
 
 def test_postgres_tunnel_used_for_queries_and_dump(secrets, ctx, tmp_path):
-    FakeTunnel.opened.clear()
     conn = Connection.new("rds", Kind.POSTGRES)
     conn.pg.host = "db.internal"
     conn.tunnel = SshTarget(alias="bastion")
@@ -362,12 +367,24 @@ def test_postgres_tunnel_used_for_queries_and_dump(secrets, ctx, tmp_path):
     assert "-h 127.0.0.1 -p 55432" in run.calls[0]
 
 
-def test_verify_rejects_dump_without_table_data(secrets, ctx, docker_conn, tmp_path):
-    cap = FakeCapture(**{"pg_restore -l": (0, TOC_EMPTY, "")})
+@pytest.mark.parametrize("toc_result, message", [
+    ((0, TOC_EMPTY, ""), "no table data"),
+    ((1, "", "pg_restore: error: input file does not appear to be a valid archive"),
+     "valid archive"),
+])
+def test_verify_rejects_dump_without_table_data(secrets, ctx, docker_conn, tmp_path,
+                                                toc_result, message):
+    cap = FakeCapture(**{"pg_restore -l": toc_result})
     job, _, _ = make_job(secrets, ctx, capture=cap)
-    with pytest.raises(JobError, match="table data"):
+    with pytest.raises(JobError, match=message) as exc:
         job.run(opts(docker_conn, tmp_path))
+    assert not list(tmp_path.glob("*.dump"))  # never under a final-looking name
+    parts = list(tmp_path.glob("*.dump.part"))
+    assert len(parts) == 1 and parts[0].name in str(exc.value)
+    assert "Verification failed" in next(tmp_path.glob("*.dump.log")).read_text()
+    assert cap.called("pg_restore -l")[0].endswith(".dump.part")
     assert not (tmp_path / "SHA256SUMS").exists()
+    assert not list(tmp_path.glob("*.json"))
 
 
 def test_missing_pg_restore_skips_verify_with_warning(secrets, ctx, docker_conn, tmp_path):
@@ -399,6 +416,27 @@ def test_filestore_tar_rc2_fails_and_keeps_part(secrets, ctx, docker_conn, tmp_p
         job.run(opts(docker_conn, tmp_path, db=False, fs=True))
     assert len(list(tmp_path.glob("*.tar.part"))) == 1
     assert len(list(tmp_path.glob("*.tar.log"))) == 1
+
+
+def test_unreadable_filestore_archive_kept_as_part(secrets, ctx, docker_conn, tmp_path):
+    run = FakeRun(**{"tar ": (b"this is not a tar archive" * 40, 0, [], False)})
+    job, _, _ = make_job(secrets, ctx, run=run)
+    with pytest.raises(JobError, match="unreadable") as exc:
+        job.run(opts(docker_conn, tmp_path, db=False, fs=True))
+    assert not list(tmp_path.glob("*.tar"))
+    parts = list(tmp_path.glob("*.tar.part"))
+    assert len(parts) == 1 and parts[0].name in str(exc.value)
+    assert "Verification failed" in next(tmp_path.glob("*.tar.log")).read_text()
+    assert not (tmp_path / "SHA256SUMS").exists()
+
+
+def test_filestore_failure_mentions_saved_db_dump(secrets, ctx, docker_conn, tmp_path):
+    run = FakeRun(**{"tar ": (b"partial", 2, ["tar: fatal"], False)})
+    job, _, _ = make_job(secrets, ctx, run=run)
+    with pytest.raises(JobError, match="database dump was saved") as exc:
+        job.run(opts(docker_conn, tmp_path, fs=True))
+    db_file = next(tmp_path.glob("*.dump"))
+    assert str(db_file) in str(exc.value)
 
 
 def test_filestore_count_mismatch_warning(secrets, ctx, docker_conn, tmp_path):

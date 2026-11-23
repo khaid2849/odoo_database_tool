@@ -10,7 +10,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import NoReturn, Optional, Tuple
 
 from . import filestore
 from .archive import (Manifest, append_sha256sums, dump_filename, filestore_filename,
@@ -18,7 +18,7 @@ from .archive import (Manifest, append_sha256sums, dump_filename, filestore_file
 from .jobs import Check, JobContext, JobError, human_bytes
 from .models import Connection, Kind, validate_identifier
 from .runner import RunResult, run_capture, run_stream
-from .ssh import _REASONS, Cmd, Tunnel, classify_ssh_error
+from .ssh import Cmd, Tunnel, classify_ssh_error, reason_text
 from .store import SECRET_FIELDS
 from .tools import parse_pg_version, pg_major
 
@@ -179,7 +179,12 @@ class DumpJob:
             if opts.with_db:
                 files.append(self._dump_db(opts, facts, dest, now, warnings))
             if opts.with_filestore:
-                files.append(self._dump_filestore(opts, facts, dest, now, warnings))
+                try:
+                    files.append(self._dump_filestore(opts, facts, dest, now, warnings))
+                except JobError as exc:
+                    if files:
+                        raise JobError(f"{exc}\nThe database dump was saved: {files[0]}") from None
+                    raise
         self.ctx.progress(100, "Done")
         self.ctx.log("Done: " + ", ".join(f.name for f in files))
         return DumpResult(files, warnings)
@@ -381,17 +386,24 @@ class DumpJob:
         self.ctx.log(f"Dumping {opts.db} to {out}")
         self.ctx.progress(None, "Dumping database…")
         start = time.monotonic()
-        res = self._run(cmd, part,
-                        on_bytes=lambda n: self.ctx.progress(None, f"Dumping database… {human_bytes(n)}"),
-                        on_line=self.ctx.log, cancel=self.ctx.cancel, redactor=self.ctx.redactor)
-        self._settle(res, conn, part, log, out, "pg_dump", (0,))
+
+        def on_bytes(n: int) -> None:
+            elapsed = _elapsed(time.monotonic() - start)
+            self.ctx.progress(None, f"Dumping database… {human_bytes(n)} ({elapsed})")
+
+        res = self._run(cmd, part, on_bytes=on_bytes, on_line=self.ctx.log,
+                        cancel=self.ctx.cancel, redactor=self.ctx.redactor)
+        self._check_stream(res, conn, part, log, "pg_dump", (0,))
         self.ctx.log(f"Database dump: {human_bytes(res.bytes_out)} in "
                      f"{_elapsed(time.monotonic() - start)}")
-        self._verify_db(out, facts, warnings)
+        self._verify_db(part, out, log, res.stderr_tail, facts, warnings)
+        self._promote(part, out, log, res.stderr_tail)
         self._seal(out, opts, facts, "db")
         return out
 
-    def _verify_db(self, out: Path, facts: _Facts, warnings: list[str]) -> None:
+    def _verify_db(self, part: Path, out: Path, log: Path, tail: list[str], facts: _Facts,
+                   warnings: list[str]) -> None:
+        """Check the still-partial file; a bad dump never gets the final name."""
         info = self.settings.tool("pg_restore")
         if info is None:
             return self._warn(warnings, f"pg_restore not found: {out.name} was not verified.")
@@ -399,14 +411,14 @@ class DumpJob:
             return self._warn(warnings, f"pg_restore {info.version} is older than pg_dump "
                                         f"{facts.pg_dump_version}: {out.name} was not verified.")
         self.ctx.progress(None, "Verifying database dump…")
-        rc, text, err = self._capture_cmd(Cmd([info.path, "-l", str(out)]), timeout=600)
+        rc, text, err = self._capture_cmd(Cmd([info.path, "-l", str(part)]), timeout=600)
         if rc != 0:
-            raise JobError(f"pg_restore cannot read {out.name}: {_last_line(err) or f'exit {rc}'}. "
-                           "The file was kept.")
+            self._reject(part, log, tail + err.splitlines(),
+                         f"pg_restore cannot read the dump: {_last_line(err) or f'exit {rc}'}.")
         toc = parse_toc(text)
         self.ctx.log(f"TOC entries: {toc.entries}, TABLE DATA: {toc.table_data}")
         if toc.table_data == 0:
-            raise JobError(f"{out.name} has no table data. The file was kept for inspection.")
+            self._reject(part, log, tail, "The dump has no table data.")
 
     # --- filestore -------------------------------------------------------------------
 
@@ -426,7 +438,8 @@ class DumpJob:
         self.ctx.log(f"Archiving filestore of {opts.db} to {out}")
         self.ctx.progress(0 if total else None, "Copying filestore…")
         if conn.kind == Kind.LOCAL:
-            self._tar_local(opts, part, log, out, on_bytes)
+            self._tar_local(opts, part, log, on_bytes)
+            tail = []
         else:
             try:
                 cmd = self.builder.filestore_tar(conn, opts.db, opts.gzip)
@@ -434,15 +447,17 @@ class DumpJob:
                 raise JobError(str(exc)) from None
             res = self._run(cmd, part, on_bytes=on_bytes, on_line=self.ctx.log,
                             cancel=self.ctx.cancel, redactor=self.ctx.redactor)
-            self._settle(res, conn, part, log, out, "tar", (0, 1))
+            self._check_stream(res, conn, part, log, "tar", (0, 1))
+            tail = res.stderr_tail
             if res.rc == 1:  # GNU tar: files changed while being read (live filestore)
                 self._warn(warnings, "tar reported files changed during the copy (normal on a "
                                      f"live system); see {log.name}.")
-        count = self._verify_filestore(out, facts, warnings)
+        count = self._verify_filestore(part, out, log, tail, facts, warnings)
+        self._promote(part, out, log, tail)
         self._seal(out, opts, facts, "filestore", count)
         return out
 
-    def _tar_local(self, opts: DumpOptions, part: Path, log: Path, out: Path, on_bytes) -> None:
+    def _tar_local(self, opts: DumpOptions, part: Path, log: Path, on_bytes) -> None:
         root = Path(opts.conn.effective_filestore_root())
         try:
             filestore.tar_directory(root, opts.db, part, opts.gzip, on_bytes=on_bytes,
@@ -454,19 +469,16 @@ class DumpJob:
             msg = self._red(str(exc))
             self._write_log(log, [msg])
             raise JobError(f"Filestore archive failed: {msg}. Log: {log.name}.") from None
-        try:
-            os.replace(part, out)
-        except OSError as exc:
-            raise JobError(f"Cannot rename {part.name}: {exc.strerror or exc}") from None
-        _unlink(log)
 
-    def _verify_filestore(self, out: Path, facts: _Facts, warnings: list[str]) -> int:
+    def _verify_filestore(self, part: Path, out: Path, log: Path, tail: list[str], facts: _Facts,
+                          warnings: list[str]) -> int:
+        """List the still-partial archive; an unreadable one never gets the final name."""
         self.ctx.progress(None, "Verifying filestore archive…")
         try:
-            with tarfile.open(out, "r|*") as tf:
+            with tarfile.open(part, "r|*") as tf:
                 count = sum(1 for m in tf if not m.isdir())
         except (OSError, tarfile.TarError) as exc:
-            raise JobError(f"Cannot read {out.name}: {exc}. The file was kept.") from None
+            self._reject(part, log, tail, f"The filestore archive is unreadable: {exc}.")
         self.ctx.log(f"Files in archive: {count} (source had {facts.fs_files} when checked)")
         diff = abs(facts.fs_files - count)
         if diff > facts.fs_files // 100 + 5:
@@ -476,9 +488,9 @@ class DumpJob:
 
     # --- shared steps ----------------------------------------------------------------
 
-    def _settle(self, res: RunResult, conn: Connection, part: Path, log: Path, out: Path,
-                what: str, ok_rcs: tuple) -> None:
-        """Handle a finished stream: delete on cancel, keep .part + .log on failure, else rename."""
+    def _check_stream(self, res: RunResult, conn: Connection, part: Path, log: Path,
+                      what: str, ok_rcs: tuple) -> None:
+        """Delete the .part on cancel; keep .part + .log and raise on failure."""
         if res.cancelled or self.ctx.cancel.cancelled:
             _unlink(part)
             _unlink(log)
@@ -487,12 +499,21 @@ class DumpJob:
             self._write_log(log, res.stderr_tail)
             raise JobError(f"{self._stream_failure(conn, res, what)} "
                            f"Partial file kept: {part.name}. Log: {log.name}.")
+
+    def _reject(self, part: Path, log: Path, tail: list[str], reason: str) -> NoReturn:
+        """Verification failed: keep the file as .part, explain in the .log, raise."""
+        reason = self._red(reason)
+        self._write_log(log, list(tail) + [f"Verification failed: {reason}"])
+        raise JobError(f"{reason} The file was kept as {part.name}. Log: {log.name}.")
+
+    def _promote(self, part: Path, out: Path, log: Path, tail: list[str]) -> None:
+        """Give a verified file its final name; keep a .log only if stderr had content."""
         try:
             os.replace(part, out)
         except OSError as exc:
             raise JobError(f"Cannot rename {part.name}: {exc.strerror or exc}") from None
-        if any(line.strip() for line in res.stderr_tail):
-            self._write_log(log, res.stderr_tail)
+        if any(line.strip() for line in tail):
+            self._write_log(log, tail)
         else:
             _unlink(log)
 
@@ -503,7 +524,7 @@ class DumpJob:
             kind = classify_ssh_error("\n".join(res.stderr_tail), 255)
             if kind in (None, "connection_lost"):
                 return f"Connection lost during {what} (ssh exit 255)."
-            return f"SSH failed during {what}: {_REASONS[kind]}."
+            return f"SSH failed during {what}: {reason_text(kind)}."
         last = self._red(_last_line(res.stderr_tail))
         return f"{what} failed (exit {res.rc})" + (f": {last}." if last else ".")
 
@@ -564,7 +585,7 @@ class DumpJob:
     def _failure(self, conn: Connection, rc: int, err: str, ssh: bool = False) -> str:
         kind = classify_ssh_error(err, rc) if ssh or conn.kind in _SSH_KINDS else None
         if kind:
-            return _REASONS[kind]
+            return reason_text(kind)
         return self._red(_last_line(err)) or f"exit code {rc}"
 
     @staticmethod

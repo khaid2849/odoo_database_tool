@@ -174,6 +174,11 @@ _REASONS = {
 }
 
 
+def reason_text(kind: str) -> str:
+    """Human wording for a `classify_ssh_error` kind."""
+    return _REASONS.get(kind, "the SSH command failed")
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))

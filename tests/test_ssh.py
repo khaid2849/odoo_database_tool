@@ -10,7 +10,7 @@ import pytest
 from odoo_database_tool import ssh
 from odoo_database_tool.models import SshTarget
 from odoo_database_tool.ssh import (
-    Tunnel, add_known_host, classify_ssh_error, ssh_argv, ssh_cmd, supports_askpass,
+    Tunnel, add_known_host, classify_ssh_error, reason_text, ssh_argv, ssh_cmd, supports_askpass,
 )
 
 
@@ -66,6 +66,11 @@ def test_supports_askpass(v, ok):
     ("", 0, None)])
 def test_classify_ssh_error(stderr, rc, kind):
     assert classify_ssh_error(stderr, rc) == kind
+
+
+def test_reason_text():
+    assert reason_text("connection_lost") == "the connection was lost"
+    assert reason_text("unknown") == "the SSH command failed"
 
 
 def test_add_known_host_appends(tmp_path):
