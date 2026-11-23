@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QByteArray, QSettings
 
 from .common import ORG_NAME
 from .tools import ToolInfo, detect_tool
@@ -77,6 +77,19 @@ class AppSettings:
     @theme.setter
     def theme(self, value: str) -> None:
         self._q.setValue("theme", value)
+
+    def clear_tool_cache(self) -> None:
+        """Forget detected tools so the next lookup probes the disk again."""
+        self._tool_cache.clear()
+
+    @property
+    def window_geometry(self) -> QByteArray:
+        value = self._q.value("window/geometry")
+        return value if isinstance(value, QByteArray) else QByteArray()
+
+    @window_geometry.setter
+    def window_geometry(self, value: QByteArray) -> None:
+        self._q.setValue("window/geometry", value)
 
     def tool(self, name: str) -> ToolInfo | None:
         key = (name, self.tool_override(name))

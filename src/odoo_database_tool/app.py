@@ -1,10 +1,11 @@
-"""Application bootstrap (placeholder window until the UI tasks land)."""
+"""Application bootstrap."""
 from __future__ import annotations
 
-from PySide6.QtWidgets import QApplication, QMainWindow
+from PySide6.QtWidgets import QApplication
 
 from .common import APP_NAME, ORG_NAME, make_icon
-from .theme import apply_theme, stylesheet
+from .settings import AppSettings
+from .ui.main_window import MainWindow, apply_app_theme
 
 
 def run(argv: list[str]) -> int:
@@ -13,9 +14,8 @@ def run(argv: list[str]) -> int:
     app.setOrganizationName(ORG_NAME)
     app.setWindowIcon(make_icon())
     app.setStyle("Fusion")
-    app.setStyleSheet(stylesheet(apply_theme("system")))
-    win = QMainWindow()
-    win.setWindowTitle(APP_NAME)
-    win.resize(900, 600)
+    settings = AppSettings()
+    apply_app_theme(settings.theme)
+    win = MainWindow(settings=settings)
     win.show()
     return app.exec()
