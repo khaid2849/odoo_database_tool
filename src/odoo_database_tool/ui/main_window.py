@@ -13,6 +13,7 @@ from ..settings import AppSettings
 from ..store import ConnectionStore, Secrets
 from ..theme import apply_theme, stylesheet
 from ..tools import detect_ssh
+from . import dialogs
 from .connections_tab import ConnectionsTab
 from .dump_tab import DumpTab
 from .log_panel import LogPanel
@@ -40,6 +41,10 @@ class MainWindow(QMainWindow):
         self._worker: Optional[Worker] = None
         self._on_done: Optional[Callable[[object], None]] = None
         self._on_failed: Optional[Callable[[str], None]] = None
+        self._quit_when_done = False
+        # Injectable seam: True to cancel the running job and quit.
+        self.confirm_quit = lambda: dialogs.confirm(
+            self, "Quit", "An operation is running. Cancel it and quit?", danger=True)
 
         self.setWindowTitle(APP_NAME)
         self.resize(1000, 700)
@@ -129,19 +134,28 @@ class MainWindow(QMainWindow):
 
     def _job_succeeded(self, result: object) -> None:
         on_done, _ = self._finish_job()
-        if on_done:
+        if self._quit_when_done:
+            self.close()
+        elif on_done:
             on_done(result)
 
     def _job_failed(self, message: str) -> None:
         _, on_failed = self._finish_job()
         self.log_panel.append(f"Failed: {message}")
         self.log_panel.flush()
-        if on_failed:
+        if self._quit_when_done:
+            self.close()
+        elif on_failed:
             on_failed(message)
 
     def closeEvent(self, event) -> None:
-        self.settings.window_geometry = self.saveGeometry()
         if self._worker is not None:
-            self._worker.cancel()
-            self._worker.wait(10000)
+            # Never destroy a running QThread: cancel, then close once the worker has finished
+            # (follow-up callbacks are skipped so no dialog or next job starts meanwhile).
+            event.ignore()
+            if not self._quit_when_done and self.confirm_quit():
+                self._quit_when_done = True
+                self._cancel_job()
+            return
+        self.settings.window_geometry = self.saveGeometry()
         super().closeEvent(event)

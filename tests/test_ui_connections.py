@@ -166,6 +166,21 @@ def test_confirm_typed_ok_only_for_exact_text(qapp):
     assert seen == [False, False, True]
 
 
+def test_confirm_custom_button_texts_and_default(qapp):
+    seen = []
+
+    def prompt(dlg):
+        box = dlg.findChild(QDialogButtonBox)
+        ok, cancel = box.button(QDialogButtonBox.Ok), box.button(QDialogButtonBox.Cancel)
+        seen.append((ok.text(), cancel.text(), ok.isDefault()))
+        return True
+
+    assert dialogs.confirm(None, "Neutralize", "Now?", ok_text="Yes", cancel_text="No",
+                           prompt=prompt)
+    dialogs.confirm(None, "t", "m", prompt=prompt)
+    assert seen == [("Yes", "No", True), ("OK", "Cancel", True)]
+
+
 def test_confirm_and_host_key_use_prompt(qapp):
     assert dialogs.confirm(None, "t", "m", danger=True, prompt=lambda d: False) is False
     shown = []
@@ -184,6 +199,7 @@ class FakeWindow(QObject):
         super().__init__()
         self.settings = object()
         self.jobs = []
+        self.logs = []
         self.refuse = False
 
     def builder(self):
@@ -194,7 +210,7 @@ class FakeWindow(QObject):
     def run_job(self, fn, on_done, on_failed=None):
         if self.refuse:
             return False
-        ctx = JobContext(log=lambda t: None, progress=lambda p, t: None,
+        ctx = JobContext(log=self.logs.append, progress=lambda p, t: None,
                          cancel=CancelToken(), redactor=Redactor())
         self.jobs.append(fn)
         try:
@@ -211,7 +227,6 @@ class FakeWindow(QObject):
 def tab(qapp, tmp_path, secrets):
     window = FakeWindow()
     t = ConnectionsTab(ConnectionStore(tmp_path / "c.json"), secrets, window)
-    t.window = window
     # Never touch real hosts: host key helpers are faked unless a test overrides them.
     t.resolve_host_port = lambda ssh_bin, target: (target.destination(), target.port)
     t.host_key_known = lambda host, port, ssh_bin="ssh": True
@@ -359,24 +374,37 @@ def test_test_checks_tunnel_host_key_too(tab):
 
 
 def test_fetch_failure_reported(tab):
-    saved(tab, "ssh", Kind.SSH_HOST, ssh=SshTarget(alias="box"))
+    saved(tab, "ssh", Kind.SSH_HOST, ssh=SshTarget(host="box"))  # direct host: no jump to blame
     tab.host_key_known = lambda *a, **k: False
 
     def boom(*a, **k):
         raise RuntimeError("Could not fetch host keys from box:22")
 
     tab.fetch_host_keys = boom
+    tab.job_factory = lambda ctx: pytest.fail("must not test")
     tab.test()
     assert "Could not fetch" in tab.results.toPlainText()
 
 
-def test_test_button_disabled_while_job_runs(tab):
+def test_buttons_disabled_while_job_runs(tab):
     saved(tab)
-    assert tab.test_button.isEnabled()
-    tab.window.job_running.emit(True)
-    assert not tab.test_button.isEnabled()
-    tab.window.job_running.emit(False)
-    assert tab.test_button.isEnabled()
+    buttons = (tab.test_button, tab.edit_button, tab.duplicate_button, tab.delete_button)
+    assert all(b.isEnabled() for b in buttons)
+    tab.main.job_running.emit(True)
+    assert not any(b.isEnabled() for b in buttons) and tab.add_button.isEnabled()
+    tab.open_dialog = lambda c: pytest.fail("must not edit while a job runs")
+    tab.confirm = lambda *a, **k: pytest.fail("must not delete while a job runs")
+    tab.edit()
+    tab.duplicate()
+    tab.delete()
+    assert len(tab.store.load()) == 1
+    tab.main.job_running.emit(False)
+    assert all(b.isEnabled() for b in buttons)
+
+
+def test_tab_does_not_shadow_qwidget_window(tab):
+    assert tab.window() is not None and callable(tab.window)
+    assert isinstance(tab.main, FakeWindow)
 
 
 def test_format_checks_marks():
@@ -389,3 +417,108 @@ def test_main_window_uses_connections_tab(qapp, tmp_path):
     from test_ui_shell import make_window
     win = make_window(tmp_path)
     assert isinstance(win.connections_tab, ConnectionsTab)
+
+
+# --- final review fixes ------------------------------------------------------------------
+
+@pytest.mark.parametrize("target", [SshTarget(host="db.internal", proxy_jump="bastion"),
+                                    SshTarget(alias="behind-jump")])
+def test_keyscan_failure_through_jump_still_runs_test(tab, target):
+    saved(tab, "ssh", Kind.SSH_HOST, ssh=target)
+    tab.host_key_known = lambda *a, **k: False
+
+    def boom(*a, **k):
+        raise RuntimeError("Could not fetch host keys from db.internal:22")
+
+    tab.fetch_host_keys = boom
+    tab.confirm_host_key = lambda *a: pytest.fail("nothing to confirm")
+    ran = []
+
+    class FakeJob:
+        def test_connection(self, conn):
+            ran.append(conn.name)
+            return [Check("Hostname", False, "the host key is not trusted yet", "Use Test")]
+
+    tab.job_factory = lambda ctx: FakeJob()
+    tab.test()
+    assert ran == ["ssh"]
+    assert any("Could not fetch the host key directly (jump host?). ssh will verify it." in line
+               for line in tab.main.logs)
+    assert "Hostname" in tab.results.toPlainText()
+
+
+def test_open_dialog_passes_container_lister(tab, monkeypatch):
+    from odoo_database_tool.ui import connections_tab as ct
+
+    seen = {}
+
+    class FakeDialog:
+        Accepted = 1
+
+        def __init__(self, conn, secrets, version, parent=None, **kwargs):
+            seen.update(kwargs)
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(ct, "ConnectionDialog", FakeDialog)
+    monkeypatch.setattr(ct.ssh, "openssh_version", lambda ssh_bin: (9, 0))
+    assert tab._open_dialog(Connection.new("x", Kind.SSH_DOCKER)) is None
+    assert seen["run_job"] == tab.main.run_job and seen["make_builder"] == tab.main.builder
+
+
+def docker_dialog(secrets, window, capture):
+    from odoo_database_tool.commands import CommandBuilder
+
+    class Settings:
+        def tool(self, name):
+            return None
+
+    conn = Connection.new("staging", Kind.SSH_DOCKER)
+    conn.ssh.alias = "my-server"
+    dlg = ConnectionDialog(conn, secrets, (9, 0), run_job=window.run_job,
+                           make_builder=lambda: CommandBuilder(Settings(), secrets, "ssh"))
+    dlg.capture = capture
+    return dlg
+
+
+def test_list_containers_fills_the_picked_name(qapp, secrets):
+    window, calls, offered = FakeWindow(), [], []
+
+    def capture(cmd, *, timeout=60, redactor=None):
+        calls.append(cmd.argv)
+        return 0, "odoo-1\ndb-1\n\n", ""
+
+    dlg = docker_dialog(secrets, window, capture)
+    dlg.pick_container = lambda names: offered.append(names) or "db-1"
+    assert dlg.list_button.text() == "List…" and dlg.list_button.isEnabled()
+    dlg.list_button.click()
+    assert calls[0][-1] == "docker ps --format '{{.Names}}'" and calls[0][-2] == "my-server"
+    assert offered == [["odoo-1", "db-1"]] and dlg.container_edit.text() == "db-1"
+    assert len(window.jobs) == 1  # ran as a background job
+
+
+def test_list_containers_cancel_keeps_name_and_reports_failures(qapp, secrets):
+    window = FakeWindow()
+    dlg = docker_dialog(secrets, window, lambda cmd, **k: (0, "odoo-1\n", ""))
+    dlg.container_edit.setText("keep-me")
+    dlg.pick_container = lambda names: None
+    dlg.list_button.click()
+    assert dlg.container_edit.text() == "keep-me"
+
+    dlg.capture = lambda cmd, **k: (255, "", "Permission denied (publickey).")
+    dlg.list_button.click()
+    assert "authentication failed" in dlg.container_status.text()
+
+    dlg.capture = lambda cmd, **k: (0, "\n", "")
+    dlg.pick_container = lambda names: pytest.fail("nothing to pick")
+    dlg.list_button.click()
+    assert "No running containers" in dlg.container_status.text()
+
+
+def test_list_containers_needs_ssh_target(qapp, secrets):
+    window = FakeWindow()
+    dlg = docker_dialog(secrets, window, lambda cmd, **k: pytest.fail("must not run"))
+    dlg.ssh_group.alias.clear()
+    dlg.list_button.click()
+    assert window.jobs == [] and "SSH" in dlg.container_status.text()

@@ -26,9 +26,10 @@ def _base(parent: Optional[QWidget], title: str, message: str) -> tuple:
     return dlg, layout
 
 
-def _buttons(dlg: QDialog, ok_text: str = "OK") -> QDialogButtonBox:
+def _buttons(dlg: QDialog, ok_text: str = "OK", cancel_text: str = "Cancel") -> QDialogButtonBox:
     box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
     box.button(QDialogButtonBox.Ok).setText(ok_text)
+    box.button(QDialogButtonBox.Cancel).setText(cancel_text)
     box.accepted.connect(dlg.accept)
     box.rejected.connect(dlg.reject)
     dlg.layout().addWidget(box)
@@ -36,13 +37,15 @@ def _buttons(dlg: QDialog, ok_text: str = "OK") -> QDialogButtonBox:
 
 
 def confirm(parent: Optional[QWidget], title: str, message: str, danger: bool = False,
-            prompt: Prompt = None) -> bool:
-    """OK / Cancel question; danger styles OK red and makes Cancel the default."""
+            prompt: Prompt = None, ok_text: str = "OK", cancel_text: str = "Cancel") -> bool:
+    """OK / Cancel question (OK is the default); danger styles OK red and defaults to Cancel."""
     dlg, _ = _base(parent, title, message)
-    box = _buttons(dlg)
+    box = _buttons(dlg, ok_text, cancel_text)
     if danger:
         box.button(QDialogButtonBox.Ok).setObjectName("dangerBtn")
         box.button(QDialogButtonBox.Cancel).setDefault(True)
+    else:
+        box.button(QDialogButtonBox.Ok).setDefault(True)
     return (prompt or _exec)(dlg)
 
 

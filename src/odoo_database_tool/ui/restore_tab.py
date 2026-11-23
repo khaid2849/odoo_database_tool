@@ -492,16 +492,22 @@ class RestoreTab(QWidget):
         self._clear_databases()  # the server's list changed; reload before the next restore
         if outcome.status == "partial":
             self._show_partial(plan, outcome)
-            return
-        self.status.setText("Restore finished.")
-        self._show_ok(plan, outcome, duration, None, outcome.quick)
-        if not self.confirm(self, "Neutralize",
-                            f"Neutralize {plan.db} now?\n\nThis turns off outgoing mail servers, "
-                            "scheduled actions and other integrations in this copy, using the "
-                            "installed modules' neutralize.sql files."):
-            self._show_ok(plan, outcome, duration, NeutralizeResult(False, None), outcome.quick)
-            return
-        self._neutralize(plan, outcome, duration)
+        elif outcome.status == "ok":
+            self.status.setText("Restore finished.")
+            self._show_ok(plan, outcome, duration, None, outcome.quick)
+            if not self.confirm(self, "Neutralize",
+                                f"Neutralize {plan.db} now?\n\nThis turns off outgoing mail "
+                                "servers, scheduled actions and other integrations in this copy, "
+                                "using the installed modules' neutralize.sql files.",
+                                ok_text="Yes", cancel_text="No"):
+                self._show_ok(plan, outcome, duration, NeutralizeResult(False, None),
+                              outcome.quick)
+                return
+            self._neutralize(plan, outcome, duration)
+        else:
+            self.status.setText("")
+            self._card("resultBad", f"Restore ended with an unknown status '{outcome.status}'. "
+                                    f"Check {plan.db} and the log before using it.")
 
     def _neutralize(self, plan: RestorePlan, outcome: RestoreOutcome, duration: float) -> None:
         def work(ctx):
@@ -517,7 +523,10 @@ class RestoreTab(QWidget):
 
         def done(value) -> None:
             res, quick = value
-            self.status.setText("Neutralized." if res.ok else "Neutralize failed.")
+            if not res.ok:
+                self.status.setText("Neutralize failed.")
+            else:
+                self.status.setText("Neutralized with warnings." if res.missing else "Neutralized.")
             self._show_ok(plan, outcome, duration, res, quick or outcome.quick)
 
         def failed(message: str) -> None:
@@ -548,6 +557,11 @@ class RestoreTab(QWidget):
         self._card("resultOk", "\n".join(lines))
         if nres is None:
             self._set(self.neutralize_status, "resultBad", "Not neutralized yet.")
+        elif nres.ok and nres.missing:
+            self._set(self.neutralize_status, "resultBad",
+                      f"Partly neutralized (Odoo {nres.series}, {len(nres.files)} files).\n"
+                      "⚠ Not neutralized for modules not found in the addons set: "
+                      + ", ".join(nres.missing))
         elif nres.ok:
             self._set(self.neutralize_status, "resultOk",
                       f"Neutralized (Odoo {nres.series}, {len(nres.files)} files)")

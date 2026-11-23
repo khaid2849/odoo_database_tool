@@ -45,10 +45,10 @@ def ssh_targets(conn: Connection) -> list:
 class ConnectionsTab(QWidget):
     connections_changed = Signal()
 
-    def __init__(self, store: ConnectionStore, secrets: Secrets, window, parent=None):
-        """`window` provides settings, builder(), run_job() and the job_running signal."""
+    def __init__(self, store: ConnectionStore, secrets: Secrets, main, parent=None):
+        """`main` (the main window) provides settings, builder(), run_job() and job_running."""
         super().__init__(parent)
-        self.store, self.secrets, self.window = store, secrets, window
+        self.store, self.secrets, self.main = store, secrets, main
         # Injectable seams (tests replace these; none of them touch the network by default).
         self.pick_kind = self._pick_kind
         self.open_dialog = self._open_dialog
@@ -59,7 +59,7 @@ class ConnectionsTab(QWidget):
         self.host_key_known = ssh.host_key_known
         self.fetch_host_keys = ssh.fetch_host_keys
         self.add_known_host = ssh.add_known_host
-        self.job_factory = lambda ctx: DumpJob(self.window.builder(), self.window.settings, ctx)
+        self.job_factory = lambda ctx: DumpJob(self.main.builder(), self.main.settings, ctx)
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Name", "Type", ""])
@@ -100,7 +100,7 @@ class ConnectionsTab(QWidget):
         layout.addWidget(self.results)
 
         self._job_active = False
-        job_running = getattr(window, "job_running", None)
+        job_running = getattr(main, "job_running", None)
         if job_running is not None:
             job_running.connect(self._on_job_running)
         self.refresh()
@@ -135,10 +135,9 @@ class ConnectionsTab(QWidget):
         self._update_buttons()
 
     def _update_buttons(self) -> None:
-        has = self.selected_id() is not None
-        for b in (self.edit_button, self.duplicate_button, self.delete_button):
-            b.setEnabled(has)
-        self.test_button.setEnabled(has and not self._job_active)
+        ready = self.selected_id() is not None and not self._job_active
+        for b in (self.edit_button, self.duplicate_button, self.delete_button, self.test_button):
+            b.setEnabled(ready)
 
     def _changed(self, select_id: Optional[str] = None) -> None:
         self.refresh(select_id)
@@ -154,8 +153,9 @@ class ConnectionsTab(QWidget):
         return next(k for k, v in KIND_LABELS.items() if v == label)
 
     def _open_dialog(self, conn: Connection) -> Optional[Connection]:
-        ssh_bin = self.window.builder().ssh_bin
-        dlg = ConnectionDialog(conn, self.secrets, ssh.openssh_version(ssh_bin), self)
+        ssh_bin = self.main.builder().ssh_bin
+        dlg = ConnectionDialog(conn, self.secrets, ssh.openssh_version(ssh_bin), self,
+                               run_job=self.main.run_job, make_builder=self.main.builder)
         return dlg.result_connection() if dlg.exec() == ConnectionDialog.Accepted else None
 
     def add(self) -> None:
@@ -169,7 +169,7 @@ class ConnectionsTab(QWidget):
 
     def edit(self) -> None:
         conn = self.selected()
-        if conn is None:
+        if conn is None or self._job_active:
             return
         result = self.open_dialog(conn)
         if result is not None:
@@ -178,7 +178,7 @@ class ConnectionsTab(QWidget):
 
     def duplicate(self) -> None:
         conn = self.selected()
-        if conn is None:
+        if conn is None or self._job_active:
             return
         clone = Connection.from_dict(copy.deepcopy(conn.to_dict()))
         clone.id = uuid.uuid4().hex
@@ -188,7 +188,7 @@ class ConnectionsTab(QWidget):
 
     def delete(self) -> None:
         conn = self.selected()
-        if conn is None:
+        if conn is None or self._job_active:
             return
         if not self.confirm(self, "Delete connection",
                             f"Delete '{conn.name}' and its saved passwords?", danger=True):
@@ -208,15 +208,25 @@ class ConnectionsTab(QWidget):
         if not targets:
             self._run_test(conn)
             return
-        ssh_bin = self.window.builder().ssh_bin
+        ssh_bin = self.main.builder().ssh_bin
 
         def find_unknown(ctx) -> list:
             pending = []
             for target in targets:
                 host, port = self.resolve_host_port(ssh_bin, target)
-                if not self.host_key_known(host, port, ssh_bin):
+                if self.host_key_known(host, port, ssh_bin):
+                    continue
+                try:
                     lines, fingerprints = self.fetch_host_keys(host, port, ssh_bin)
-                    pending.append((host, port, lines, fingerprints))
+                except RuntimeError:
+                    # Behind a jump host (or an alias that may use one) the host is often not
+                    # reachable directly; ssh still verifies the key and reports it if unknown.
+                    if not (target.proxy_jump or target.alias):
+                        raise
+                    ctx.log("Could not fetch the host key directly (jump host?). "
+                            "ssh will verify it.")
+                    continue
+                pending.append((host, port, lines, fingerprints))
             return pending
 
         self._start(find_unknown, lambda pending: self._accept_host_keys(conn, pending),
@@ -245,7 +255,7 @@ class ConnectionsTab(QWidget):
             self.results.setPlainText(f"✗ {failure}: {message}")
 
         self.status.setText(status)  # before run_job: a quick job may finish synchronously
-        if not self.window.run_job(fn, on_done, failed):
+        if not self.main.run_job(fn, on_done, failed):
             self.status.setText("Another operation is running.")
 
     def _show_results(self, checks: list) -> None:

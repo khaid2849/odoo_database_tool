@@ -517,3 +517,39 @@ def test_main_window_uses_restore_tab(qapp, tmp_path):
 
     win = make_window(tmp_path)
     assert isinstance(win.tabs.widget(1), RestoreTab)
+
+
+# --- final review fixes ------------------------------------------------------------------
+
+
+def test_neutralize_question_uses_yes_no_buttons(env):
+    ready(env)
+    asked = []
+
+    def confirm(parent, title, msg, danger=False, **k):
+        asked.append((title, k))
+        return True
+
+    env.tab.confirm = confirm
+    env.tab.restore_button.click()
+    assert asked[1] == ("Neutralize", {"ok_text": "Yes", "cancel_text": "No"})
+
+
+def test_neutralize_with_missing_modules_is_not_shown_complete(env):
+    ready(env)
+    env.neutralize_result = NeutralizeResult(True, "18.0", [Path("a")], missing=["custom_x", "y"])
+    env.tab.restore_button.click()
+    text = env.tab.neutralize_status.text()
+    assert "Not neutralized for modules not found in the addons set: custom_x, y" in text
+    assert not text.startswith("Neutralized")
+    assert env.tab.neutralize_status.objectName() == "resultBad"
+    assert "warning" in env.tab.status.text().lower()
+
+
+def test_unknown_outcome_status_is_red(env):
+    ready(env)
+    env.job.outcome = RestoreOutcome("weird", 0, None, 0, {}, [])
+    env.tab.restore_button.click()
+    assert env.tab.result.objectName() == "resultBad"
+    assert "weird" in env.tab.result.text()
+    assert env.neutralized == []

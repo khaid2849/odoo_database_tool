@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import pytest
+
 from conftest import wait_until
 
 from odoo_database_tool.jobs import JobError
@@ -29,6 +31,7 @@ def make_window(tmp_path):
     from odoo_database_tool.ui.main_window import MainWindow
 
     settings = AppSettings(QSettings(str(tmp_path / "s.ini"), QSettings.IniFormat))
+    settings.dump_dir = tmp_path / "dumps"  # never read the real ~/Odoo DB Dumps
     return MainWindow(settings=settings, store=ConnectionStore(tmp_path / "c.json"),
                       secrets=Secrets(FakeKeyring()))
 
@@ -245,3 +248,58 @@ def test_settings_tab_ssh_status_lines(qapp, tmp_path, monkeypatch):
     tab.refresh()
     assert tab.password_ssh_status.text().startswith("Password SSH: available") or \
         "keychain" in tab.password_ssh_status.text()
+
+
+def test_make_window_uses_temp_dump_dir(qapp, tmp_path):
+    win = make_window(tmp_path)
+    assert win.settings.dump_dir == tmp_path / "dumps"
+    assert win.dump_tab.dest_edit.text() == str(tmp_path / "dumps")
+
+
+def _long_job(started):
+    def fn(ctx):
+        started.set()
+        ctx.cancel.wait(10)
+        return "finished"
+    return fn
+
+
+def test_close_while_job_runs_declined_keeps_window_and_job(qapp, tmp_path):
+    win = make_window(tmp_path)
+    win.show()
+    started, done, asked = threading.Event(), [], []
+    win.confirm_quit = lambda: asked.append(1) or False
+    assert win.run_job(_long_job(started), done.append)
+    assert started.wait(5)
+    win.close()
+    assert asked == [1] and win.isVisible() and win.job_active
+    assert not win._worker._token.cancelled
+    win._cancel_job()
+    assert wait_until(lambda: not win.job_active)
+    assert done == ["finished"]
+    win.close()
+    assert not win.isVisible()
+
+
+def test_close_while_job_runs_accepted_cancels_then_closes(qapp, tmp_path):
+    win = make_window(tmp_path)
+    win.show()
+    started, done, asked = threading.Event(), [], []
+    win.confirm_quit = lambda: asked.append(1) or True
+    assert win.run_job(_long_job(started), done.append)
+    assert started.wait(5)
+    worker = win._worker
+    win.close()
+    assert asked == [1]
+    assert worker._token.cancelled  # cancel requested; the window waits for the worker
+    assert wait_until(lambda: not win.isVisible())
+    assert not win.job_active and worker.isFinished()
+    assert done == []  # follow-up callbacks (dialogs, next jobs) are skipped while quitting
+
+
+def test_close_without_job_does_not_ask(qapp, tmp_path):
+    win = make_window(tmp_path)
+    win.show()
+    win.confirm_quit = lambda: pytest.fail("must not ask")
+    win.close()
+    assert not win.isVisible()
