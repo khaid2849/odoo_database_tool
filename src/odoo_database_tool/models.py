@@ -126,7 +126,7 @@ def is_local_target(conn: Connection) -> bool:
 
 def validate_identifier(value: str, what: str) -> str:
     """Return value if it is a safe DB/container name, else raise ValueError."""
-    if not isinstance(value, str) or not _IDENTIFIER_RE.match(value):
+    if not isinstance(value, str) or not _IDENTIFIER_RE.fullmatch(value):
         raise ValueError(f"Invalid {what}: {value!r} (use letters, digits, '_', '.', '-')")
     return value
 

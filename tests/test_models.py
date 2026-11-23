@@ -81,7 +81,7 @@ def test_is_local_target_ssh_kinds_remote():
 
 def test_validate_identifier():
     assert validate_identifier("odoo_dev", "database") == "odoo_dev"
-    for bad in ["", "a b", "x;rm -rf", "-flag", "a'b"]:
+    for bad in ["", "a b", "x;rm -rf", "-flag", "a'b", "db\n"]:
         with pytest.raises(ValueError, match="Invalid database"):
             validate_identifier(bad, "database")
 
