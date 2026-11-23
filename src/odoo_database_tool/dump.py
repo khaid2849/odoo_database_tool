@@ -138,6 +138,39 @@ class DumpJob:
             checks, _facts = self._inspect(opts, stack)
         return checks
 
+    def test_connection(self, conn: Connection) -> list[Check]:
+        """Connections-tab Test: SSH/hostname, container, listing, server and tool versions."""
+        self._register_secrets(conn)
+        checks: list[Check] = []
+        facts = _Facts()
+        with ExitStack() as stack:
+            if conn.ssh is not None or conn.tunnel is not None:
+                check = self._check_hostname(conn, (conn.ssh or conn.tunnel).expected_hostname)
+                checks.append(check)
+                if not check.ok:
+                    return checks
+            if conn.kind == Kind.POSTGRES and conn.tunnel is not None:
+                try:
+                    facts.pg_override = self._open_tunnel(stack, conn)
+                except (RuntimeError, OSError) as exc:
+                    checks.append(Check("SSH tunnel", False, self._red(str(exc)),
+                                        _SSH_HINTS["unreachable"]))
+                    return checks
+                checks.append(Check("SSH tunnel", True, f"127.0.0.1:{facts.pg_override[1]} → "
+                                                        f"{conn.pg.host}:{conn.pg.port}"))
+            if conn.kind == Kind.SSH_DOCKER:
+                check = self._check_container(conn)
+                checks.append(check)
+                if not check.ok:
+                    return checks
+            opts = DumpOptions(conn, "postgres", True, False, False, Path("."))
+            db_checks = self._check_database(opts, facts)
+            checks.extend(db_checks)
+            if db_checks[0].ok:
+                checks.append(self._check_listing(conn, facts))
+            checks.append(self._check_pg_restore(facts))
+        return checks
+
     def run(self, opts: DumpOptions, *, confirmed_production: bool = False) -> DumpResult:
         conn = opts.conn
         if conn.production and not confirmed_production:
@@ -223,7 +256,7 @@ class DumpJob:
             checks.append(self._check_pg_restore(facts))
         return checks, facts
 
-    def _check_hostname(self, conn: Connection, expected: str) -> Check:
+    def _check_hostname(self, conn: Connection, expected: str = "") -> Check:
         name = "Hostname"
         try:
             rc, out, err = self._capture_cmd(self.builder.hostname(conn), timeout=30)
@@ -234,7 +267,7 @@ class DumpJob:
                          self._hint(conn, rc, err, "Check the SSH settings of this connection.",
                                     ssh=True))
         actual = out.strip()
-        if actual != expected:
+        if expected and actual != expected:
             return Check(name, False, f"The machine is '{actual}', expected '{expected}'.",
                          "Wrong machine? Check the SSH host/alias and the expected hostname.")
         return Check(name, True, actual)
@@ -300,6 +333,18 @@ class DumpJob:
             return Check(name, False, f"pg_dump {version} on {where} is older than the server "
                                       f"({facts.server_version}).", hint)
         return Check(name, True, f"pg_dump {version} on {where}")
+
+    def _check_listing(self, conn: Connection, facts: _Facts) -> Check:
+        name = "Database list"
+        try:
+            cmd = self.builder.psql(conn, "postgres", LIST_DATABASES_SQL, pg_override=facts.pg_override)
+        except ValueError as exc:
+            return Check(name, False, str(exc))
+        rc, out, err = self._capture_cmd(cmd)
+        if rc != 0:
+            return Check(name, False, f"Cannot list databases: {self._failure(conn, rc, err)}",
+                         self._hint(conn, rc, err, "Check the credentials and pg_hba."))
+        return Check(name, True, f"{len(parse_database_sizes(out))} databases")
 
     def _check_filestore(self, opts: DumpOptions, facts: _Facts) -> Check:
         conn, name = opts.conn, "Filestore"

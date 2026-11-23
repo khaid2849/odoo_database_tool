@@ -494,3 +494,69 @@ def test_list_databases_failure_raises_job_error(secrets, ctx, docker_conn):
     job, _, _ = make_job(secrets, ctx, capture=cap)
     with pytest.raises(JobError, match="authentication"):
         job.list_databases(docker_conn)
+
+
+# --- test_connection (Connections tab Test button) -------------------------------------
+
+def test_test_connection_docker_all_checks(secrets, ctx, docker_conn):
+    job, cap, _ = make_job(secrets, ctx)
+    checks = by_name(job.test_connection(docker_conn))
+    assert all(c.ok for c in checks.values())
+    assert {"Hostname", "Container", "Database", "pg_dump version", "Database list",
+            "pg_restore"} <= set(checks)
+    assert "2 databases" in checks["Database list"].detail
+
+
+def test_test_connection_hostname_mismatch_stops(secrets, ctx, docker_conn):
+    job, cap, _ = make_job(secrets, ctx, capture=FakeCapture(hostname=(0, "clone\n", "")))
+    checks = by_name(job.test_connection(docker_conn))
+    assert checks["Hostname"].ok is False
+    assert not cap.called("docker inspect")
+
+
+def test_test_connection_container_not_running(secrets, ctx, docker_conn):
+    job, cap, _ = make_job(secrets, ctx, capture=FakeCapture(**{"docker inspect": (0, "false\n", "")}))
+    checks = by_name(job.test_connection(docker_conn))
+    assert checks["Container"].ok is False
+    assert "Database" not in checks
+
+
+def test_test_connection_ssh_unreachable_hint(secrets, ctx, docker_conn):
+    cap = FakeCapture(hostname=(255, "", "ssh: connect to host x port 22: Operation timed out"))
+    job, _, _ = make_job(secrets, ctx, capture=cap)
+    checks = by_name(job.test_connection(docker_conn))
+    assert checks["Hostname"].ok is False and "VPN" in checks["Hostname"].hint
+
+
+def test_test_connection_ssh_without_expected_hostname_still_checks_reachable(secrets, ctx):
+    conn = Connection.new("host", Kind.SSH_HOST)
+    conn.ssh.alias = "box"
+    job, cap, _ = make_job(secrets, ctx)
+    checks = by_name(job.test_connection(conn))
+    assert checks["Hostname"].ok is True and cap.called("hostname")
+
+
+def test_test_connection_local_uses_local_tools_only(secrets, ctx):
+    conn = Connection.new("local", Kind.LOCAL)
+    job, cap, _ = make_job(secrets, ctx, settings=FakeSettings(missing=["pg_restore"]))
+    checks = by_name(job.test_connection(conn))
+    assert "Hostname" not in checks
+    assert checks["pg_restore"].warning is True
+    assert checks["Database list"].ok is True
+
+
+def test_test_connection_list_failure(secrets, ctx):
+    conn = Connection.new("local", Kind.LOCAL)
+    cap = FakeCapture(**{"pg_database_size(datname)": (2, "", "FATAL: password authentication failed")})
+    job, _, _ = make_job(secrets, ctx, capture=cap)
+    checks = by_name(job.test_connection(conn))
+    assert checks["Database list"].ok is False
+
+
+def test_test_connection_postgres_tunnel(secrets, ctx):
+    conn = Connection.new("pg", Kind.POSTGRES)
+    conn.pg.host = "db.internal"
+    conn.tunnel = SshTarget(alias="bastion")
+    job, _, _ = make_job(secrets, ctx)
+    checks = by_name(job.test_connection(conn))
+    assert checks["SSH tunnel"].ok is True and FakeTunnel.opened[0].closed

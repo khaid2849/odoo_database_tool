@@ -134,6 +134,16 @@ class Secrets:
             return
         self._backend.set_password(SERVICE, key, value)
 
+    def delete(self, conn_id: str, field: str) -> None:
+        """Remove one stored secret; a missing entry is fine."""
+        key = self._key(conn_id, field)
+        self._memory.pop(key, None)
+        if self.available:
+            try:
+                self._backend.delete_password(SERVICE, key)
+            except Exception:  # noqa: BLE001
+                pass
+
     def delete_all(self, conn_id: str) -> None:
         for field in SECRET_FIELDS:
             key = self._key(conn_id, field)

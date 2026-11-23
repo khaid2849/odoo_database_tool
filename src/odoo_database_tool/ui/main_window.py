@@ -15,6 +15,7 @@ from ..settings import AppSettings
 from ..store import ConnectionStore, Secrets
 from ..theme import apply_theme, stylesheet
 from ..tools import detect_ssh
+from .connections_tab import ConnectionsTab
 from .log_panel import LogPanel
 from .settings_tab import SettingsTab
 from .worker import Worker
@@ -36,6 +37,7 @@ def _placeholder(text: str) -> QWidget:
 
 class MainWindow(QMainWindow):
     job_running = Signal(bool)
+    connections_changed = Signal()
 
     def __init__(self, settings: Optional[AppSettings] = None,
                  store: Optional[ConnectionStore] = None,
@@ -79,7 +81,9 @@ class MainWindow(QMainWindow):
         return _placeholder("Restore")
 
     def _make_connections_tab(self) -> QWidget:
-        return _placeholder("Connections")
+        self.connections_tab = ConnectionsTab(self.store, self.secrets, self)
+        self.connections_tab.connections_changed.connect(self.connections_changed)
+        return self.connections_tab
 
     def _make_settings_tab(self) -> QWidget:
         tab = SettingsTab(self.settings, self.secrets)

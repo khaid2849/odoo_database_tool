@@ -144,3 +144,24 @@ def test_askpass_program_writes_wrapper_once(monkeypatch):
 def test_askpass_program_frozen(monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     assert store.askpass_program() == sys.executable
+
+
+def test_secrets_delete_single_field():
+    from odoo_database_tool.store import Secrets
+
+    class KR:
+        def __init__(self):
+            self.d = {}
+        def get_password(self, s, k):
+            return self.d.get((s, k))
+        def set_password(self, s, k, v):
+            self.d[(s, k)] = v
+        def delete_password(self, s, k):
+            self.d.pop((s, k), None)
+
+    sec = Secrets(KR())
+    sec.set("c", "pg_password", "a")
+    sec.set("c", "ssh_password", "b")
+    sec.delete("c", "pg_password")
+    sec.delete("c", "pg_password")  # missing entry is fine
+    assert sec.get("c", "pg_password") is None and sec.get("c", "ssh_password") == "b"
