@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "odoo-database-tool"
+dynamic = ["version"]
+description = "Desktop app to dump and restore Odoo databases (and filestores) for macOS, Windows and Linux"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Dang Khai" }]
+keywords = ["odoo", "database", "backup", "restore", "pg_dump", "pyside6"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: X11 Applications :: Qt",
+    "Topic :: Database",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "PySide6-Essentials>=6.6",
+    "keyring>=24",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.0", "pillow>=10"]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/khaid2849/odoo_database_tool"
+
+[project.gui-scripts]
+odoo-database-tool = "odoo_database_tool.__main__:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "odoo_database_tool.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: needs ODT_TEST_PG_URL (CI only)"]
