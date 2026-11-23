@@ -30,9 +30,9 @@ Get the latest version from the **[Releases page](https://github.com/khaid2849/o
 
 ## How to use
 
-1. Open the **Connections** tab, click **Add…** and choose a connection type. Fill in the details and click **Test** to check the connection.
+1. Open the **Connections** tab, click **Add…** and choose a connection type. Fill in the details and click **Test** to check the connection. For *SSH + Docker*, **List…** next to the container name shows the running containers on the host so you can pick one.
 2. Open the **Dump** tab, pick a connection, click **Load databases** and choose one, tick *Database* and/or *Filestore*, optionally press **Check**, then press **Dump**. Files land in `~/Odoo DB Dumps` by default (change it in **Settings**).
-3. Open the **Restore** tab, pick a dump file, the target connection and database (an existing one or a new name), optionally a filestore, press **Restore**, review the summary and confirm.
+3. Open the **Restore** tab, pick a dump file, the target connection and database (an existing one or a new name), optionally a filestore (only when the target PostgreSQL is on this computer), press **Restore**, review the summary and confirm.
 4. When the restore finishes, the app offers to neutralize the new database. For that, first add your Odoo source folders for each version (for example 18.0) in **Settings → Odoo addons sets**.
 
 ## Connection types
@@ -42,7 +42,7 @@ Get the latest version from the **[Releases page](https://github.com/khaid2849/o
 | SSH + Docker | Odoo runs in a container on a remote host | Yes | No | Yes (from the container) |
 | SSH + host Postgres | PostgreSQL is installed on the remote host | Yes | No | If you set the filestore root |
 | Direct Postgres | You can reach the PostgreSQL port, directly or through an SSH tunnel | Yes | Yes | No |
-| Local | PostgreSQL on this computer | Yes | Yes | Yes |
+| Local | PostgreSQL on this computer (`localhost`, `127.0.0.1`, `::1` or a socket folder) | Yes | Yes | Yes |
 
 ## Safety features
 
@@ -52,10 +52,12 @@ Get the latest version from the **[Releases page](https://github.com/khaid2849/o
 - Dump files are written as `.part` and renamed only when complete; a lost connection or full disk never leaves a half file looking valid.
 - SHA256 is checked on restore, and a dump that cannot be read or has no table data is refused.
 - The dump's server version is compared with your `pg_dump` / `pg_restore` before anything starts.
-- An optional **expected hostname** per SSH connection stops the app from touching a cloned or wrong machine.
-- Passwords are stored in the OS keychain, never in files, logs or command lines.
-- Filestore paths must end in `filestore/<database>`; nothing outside it is deleted.
+- An optional **expected hostname** per SSH connection or tunnel: every dump, restore and neutralize first runs `hostname` on that machine and refuses on a mismatch, so a cloned or wrong machine is never touched.
+- Passwords are stored in the OS keychain (or kept in memory for the session when there is none), never in files, logs or command lines.
+- A filestore is restored only on this computer, into `<root>/<database>`. An existing folder there is replaced only if it looks like an Odoo filestore (two-character hex subfolders) or is empty; nothing outside it is deleted.
 - If a restore fails after the old database was dropped, the app says so clearly and offers to drop the incomplete database or keep it.
+- Neutralize warns when some installed modules are not found in your addons folders, instead of reporting the database as fully neutralized.
+- Closing the window during an operation asks first, then cancels it and closes once it has stopped.
 
 ## Where data is stored
 
@@ -63,7 +65,7 @@ Get the latest version from the **[Releases page](https://github.com/khaid2849/o
   - macOS: `~/Library/Application Support/OdooDatabaseTool/`
   - Windows: `%APPDATA%\OdooDatabaseTool\`
   - Linux: `~/.config/odoo_database_tool/`
-- **Passwords** go to the OS keychain (macOS Keychain, Windows Credential Manager, Secret Service on Linux) under the service name `odoo_database_tool`. If your system has no keychain, the app asks for the password each time and keeps it in memory only.
+- **Passwords** go to the OS keychain (macOS Keychain, Windows Credential Manager, Secret Service on Linux) under the service name `odoo_database_tool`. If your system has no usable keychain, the passwords you enter are kept in memory for the current session only (never written to disk) and must be entered again after restarting the app; SSH password login is not available then, use a key or the SSH agent.
 - **Dumps, checksums (`SHA256SUMS`), manifests and logs** go to the dump folder you choose.
 
 ## Build from source
