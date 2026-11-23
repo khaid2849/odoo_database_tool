@@ -28,7 +28,8 @@ def test_cli_version(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["--version"])
     assert exc.value.code == 0
-    assert "0.1.0" in capsys.readouterr().out
+    from odoo_database_tool import __version__
+    assert __version__ in capsys.readouterr().out
 
 
 # --- frozen builds: child process environment ----------------------------------------------
