@@ -26,10 +26,14 @@ class FakeWindow(QObject):
         super().__init__()
         self.settings = FakeSettings(dump_dir)
         self.refuse = False
+        self.pending = None
 
     def run_job(self, fn, on_done, on_failed=None):
         if self.refuse:
             return False
+        if self.pending is not None:  # deferred: the test completes the job later
+            self.pending.append((fn, on_done))
+            return True
         ctx = JobContext(log=lambda t: None, progress=lambda p, t: None,
                          cancel=CancelToken(), redactor=Redactor())
         try:
@@ -63,6 +67,10 @@ class FakeJob:
         if self.error:
             raise JobError(self.error)
         return self.result
+
+
+def tmp_dest(tab):
+    return Path(tab.dest_edit.text())
 
 
 def make(kind, name="c", production=False):
@@ -167,10 +175,6 @@ def test_production_dump_confirms_and_no_does_nothing(env):
     assert ("run", "shop", True, tmp_dest(tab)) in job.calls
 
 
-def tmp_dest(tab):
-    return Path(tab.dest_edit.text())
-
-
 def test_non_production_does_not_confirm(env):
     store, _, job, tab = env
     add(store, tab, make(Kind.SSH_DOCKER))
@@ -251,3 +255,51 @@ def test_dest_defaults_to_settings_and_browse(env, tmp_path):
     tab.pick_folder = lambda start: ""
     tab.browse_button.click()
     assert tab.dest_edit.text() == str(tmp_path / "other")
+
+
+def test_empty_dest_falls_back_to_settings(env, tmp_path):
+    store, _, job, tab = env
+    add(store, tab, make(Kind.SSH_DOCKER))
+    load(tab)
+    tab.dest_edit.setText("  ")
+    job.result = DumpResult(files=[])
+    tab.dump_button.click()
+    assert job.calls[-1][3] == tmp_path / "dumps"
+
+
+def test_refused_job_shows_busy_message(env):
+    store, window, job, tab = env
+    add(store, tab, make(Kind.SSH_DOCKER))
+    window.refuse = True
+    load(tab)
+    assert tab.status.text() == "Another operation is running."
+    assert tab.db_combo.count() == 0
+
+
+def test_source_switch_during_load_discards_old_databases(env):
+    store, window, job, tab = env
+    a, b = make(Kind.SSH_DOCKER, "a"), make(Kind.LOCAL, "b")
+    store.upsert(a)
+    store.upsert(b)
+    tab.refresh_sources()
+    window.pending = []
+    load(tab)
+    window.job_running.emit(True)
+    assert not tab.source_combo.isEnabled()
+    window.job_running.emit(False)
+    tab.source_combo.setCurrentIndex(1)  # switch before the load completes
+    fn, on_done = window.pending[0]
+    on_done([("old_server_db", 1)])
+    assert tab.db_combo.count() == 0 and not tab.dump_button.isEnabled()
+
+
+def test_source_change_clears_previous_result(env):
+    store, _, job, tab = env
+    store.upsert(make(Kind.SSH_DOCKER, "a"))
+    store.upsert(make(Kind.LOCAL, "b"))
+    tab.refresh_sources()
+    load(tab)
+    tab.check_button.click()
+    assert tab.result.isVisibleTo(tab)
+    tab.source_combo.setCurrentIndex(1)
+    assert not tab.result.isVisibleTo(tab)

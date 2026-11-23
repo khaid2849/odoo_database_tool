@@ -144,6 +144,7 @@ class DumpTab(QWidget):
 
     def _source_changed(self) -> None:
         self.db_combo.clear()
+        self._clear_result()
         self._update_filestore()
         self._update_buttons()
 
@@ -163,9 +164,12 @@ class DumpTab(QWidget):
         self._update_buttons()
         self.status.setText(f"Loading databases from {conn.name}…")
         self._start(lambda ctx: self.job_factory(ctx).list_databases(conn),
-                    self._databases_loaded, "Cannot list databases")
+                    lambda dbs: self._databases_loaded(conn.id, dbs), "Cannot list databases")
 
-    def _databases_loaded(self, databases: list) -> None:
+    def _databases_loaded(self, conn_id: str, databases: list) -> None:
+        current = self.selected_connection()
+        if current is None or current.id != conn_id:
+            return  # the source changed while loading: never mix another server's databases
         self.db_combo.clear()
         for name, size in databases:
             self.db_combo.addItem(f"{name} — {human_bytes(size)}", name)
@@ -183,6 +187,7 @@ class DumpTab(QWidget):
         has_db = self.selected_db() is not None
         wants = self.db_check.isChecked() or self.filestore_check.isChecked()
         idle = not self._job_active
+        self.source_combo.setEnabled(idle)
         self.load_button.setEnabled(idle and self.selected_connection() is not None)
         self.check_button.setEnabled(idle and has_db)
         self.dump_button.setEnabled(idle and has_db and wants)
@@ -200,7 +205,7 @@ class DumpTab(QWidget):
             return None
         return DumpOptions(conn, db, self.db_check.isChecked(), self.filestore_check.isChecked(),
                            self.gzip_check.isChecked() and self.filestore_check.isChecked(),
-                           Path(self.dest_edit.text().strip()))
+                           Path(self.dest_edit.text().strip() or self.window.settings.dump_dir))
 
     def check(self) -> None:
         opts = self._options()
