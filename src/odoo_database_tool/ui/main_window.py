@@ -16,6 +16,7 @@ from ..store import ConnectionStore, Secrets
 from ..theme import apply_theme, stylesheet
 from ..tools import detect_ssh
 from .connections_tab import ConnectionsTab
+from .dump_tab import DumpTab
 from .log_panel import LogPanel
 from .settings_tab import SettingsTab
 from .worker import Worker
@@ -75,7 +76,8 @@ class MainWindow(QMainWindow):
     # --- tab factories (replaced by the Dump / Restore / Connections tasks) ------------
 
     def _make_dump_tab(self) -> QWidget:
-        return _placeholder("Dump")
+        self.dump_tab = DumpTab(self.store, self)
+        return self.dump_tab
 
     def _make_restore_tab(self) -> QWidget:
         return _placeholder("Restore")
