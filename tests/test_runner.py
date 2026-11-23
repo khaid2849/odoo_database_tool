@@ -136,9 +136,22 @@ def test_run_capture_redacts_and_times_out():
     rc, out, err = run_capture(
         py("import sys; print('a s3cr3t'); print('e s3cr3t', file=sys.stderr)"), redactor=r
     )
-    assert rc == 0 and "s3cr3t" not in out and "s3cr3t" not in err
+    assert rc == 0 and "s3cr3t" not in err
     rc, _, err = run_capture(py("import time; time.sleep(30)"), timeout=0.5)
     assert rc == 124 and "timeout" in err
+
+
+def test_run_capture_keeps_stdout_data_intact():
+    # stdout is data the app parses (database names, versions…); a password that happens
+    # to be part of a name ("odoo" in "dev_odoo18") must not corrupt it
+    r = Redactor()
+    r.add("odoo")
+    rc, out, err = run_capture(
+        py("import sys; print('dev_odoo18|42'); print('auth odoo failed', file=sys.stderr)"),
+        redactor=r,
+    )
+    assert rc == 0 and out.strip() == "dev_odoo18|42"
+    assert "odoo" not in err and "****" in err
 
 
 def test_redactor_masks():

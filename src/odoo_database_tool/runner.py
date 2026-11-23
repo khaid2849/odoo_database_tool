@@ -105,7 +105,11 @@ def _stop(proc: subprocess.Popen) -> None:
 def run_capture(
     cmd: Cmd, *, timeout: float = 60, redactor: Redactor | None = None
 ) -> tuple[int, str, str]:
-    """Run to completion and return (rc, stdout, stderr); rc 124 on timeout."""
+    """Run to completion and return (rc, stdout, stderr); rc 124 on timeout.
+
+    Only stderr is redacted: stdout is data the caller parses (database names, versions…),
+    and masking a password that happens to occur inside it would corrupt that data.
+    """
     red = redactor or (lambda t: t)
     try:
         proc = _popen(cmd)
@@ -122,7 +126,7 @@ def run_capture(
     err_s = err.decode("utf-8", errors="replace")
     if timed_out:
         err_s = (err_s + "\ntimeout").lstrip("\n")
-    return rc, red(out_s), red(err_s)
+    return rc, out_s, red(err_s)
 
 
 def run_stream(
