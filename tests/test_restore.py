@@ -33,7 +33,7 @@ TOC = """;
 TOC_EMPTY = TOC.split("5;")[0]
 DUMP_BYTES = b"PGDMP" + b"\x00" * 1000
 PG_RESTORE = ToolInfo("pg_restore", "/pg/bin/pg_restore", "17.2")
-ACTIVITY_ROW = "4242|Odoo|odoo|10.0.0.9|09:15\n"
+ACTIVITY_ROW = "4242|Odoo|odoo|10.0.0.9|2026-11-23 09:15\n"
 
 
 class FakeSettings:
@@ -46,6 +46,7 @@ class FakeCapture:
 
     def __init__(self, events, **overrides):
         self.rules = {
+            "pg_has_role": (0, "t\n", ""),
             "pg_stat_activity": (0, "", ""),
             "datcollate": (0, "en_US.UTF-8|en_US.UTF-8\n", ""),
             "pg_database_size(datname)": (0, "mydb|1048576\npostgres|8000\nother|2048\n", ""),
@@ -280,7 +281,7 @@ def test_execute_refuses_when_connections_open(secrets, ctx, local_conn, dump_fi
     with pytest.raises(JobError) as exc:
         job.execute(make_plan(dump_file, local_conn))
     msg = str(exc.value)
-    for part in ("4242", "Odoo", "odoo", "10.0.0.9", "09:15"):
+    for part in ("4242", "Odoo", "odoo", "10.0.0.9", "2026-11-23 09:15"):
         assert part in msg
     assert run.calls == []
     assert not list(dump_file.parent.glob("restore_*.log"))
@@ -288,13 +289,16 @@ def test_execute_refuses_when_connections_open(secrets, ctx, local_conn, dump_fi
 
 def test_active_connections_query_and_parse(secrets, ctx, local_conn):
     events = []
-    cap = FakeCapture(events, pg_stat_activity=(0, ACTIVITY_ROW + "77||postgres|local|08:00\n", ""))
+    cap = FakeCapture(events, pg_stat_activity=(
+        0, ACTIVITY_ROW + "77||postgres|local|2026-11-22 08:00\n", ""))
     job, _, _, _ = make_job(secrets, ctx, capture=cap, events=events)
     rows = job.active_connections(local_conn, "mydb")
-    assert rows == [Activity(4242, "Odoo", "odoo", "10.0.0.9", "09:15"),
-                    Activity(77, "", "postgres", "local", "08:00")]
+    assert rows == [Activity(4242, "Odoo", "odoo", "10.0.0.9", "2026-11-23 09:15"),
+                    Activity(77, "", "postgres", "local", "2026-11-22 08:00")]
     sql = cap.called("pg_stat_activity")[0]
     assert "datname = 'mydb'" in sql and "pid <> pg_backend_pid()" in sql
+    assert "backend_type = 'client backend'" in sql
+    assert "to_char(backend_start,'YYYY-MM-DD HH24:MI')" in sql
     assert " -d postgres " in sql
 
 
@@ -444,15 +448,19 @@ def test_vacuum_failure_is_warning(secrets, ctx, local_conn, dump_file):
     assert any("vacuumdb" in w for w in outcome.warnings)
 
 
-def test_extension_failure_stops_before_restore(secrets, ctx, local_conn, dump_file):
+def test_extension_failure_is_partial_before_restore(secrets, ctx, local_conn, dump_file):
     events = []
     cap = FakeCapture(events, **{"CREATE EXTENSION": (
         1, "", 'ERROR:  permission denied to create extension "vector"')})
     job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
-    with pytest.raises(JobError, match="superuser") as exc:
-        job.execute(make_plan(dump_file, local_conn))
-    assert "vector" in str(exc.value) and "privilege" in str(exc.value)
-    assert not run.called("pg_restore")
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    assert outcome.status == "partial" and outcome.log_path is None
+    text = "\n".join(outcome.warnings)
+    assert ("Could not create extension vector: the connection user may lack the privilege, "
+            "or the extension is not installed on the server.") in text
+    assert 'permission denied to create extension "vector"' in text
+    assert not run.called("pg_restore") and not run.called("vacuumdb")
+    assert not cap.called("pg_tables")
     assert not list(dump_file.parent.glob("restore_*.log"))
 
 
@@ -473,15 +481,15 @@ def test_drop_or_create_failure_stops(secrets, ctx, local_conn, dump_file, tool,
 def test_filestore_extracted_into_target_db_folder(secrets, ctx, local_conn, dump_file, tmp_path):
     root = tmp_path / "filestore"
     target = root / "odoo_prod"
-    (target / "zz").mkdir(parents=True)
-    (target / "zz" / "stale").write_bytes(b"old")
+    (target / "ab").mkdir(parents=True)
+    (target / "ab" / "stale").write_bytes(b"old")
     src = make_tar(tmp_path / "filestore_odoo.tar", "odoo_staging", ["0a/f1", "0a/f2", "ff/f3"])
     job, _, _, _ = make_job(secrets, ctx)
     outcome = job.execute(make_plan(dump_file, local_conn, db="odoo_prod",
                                     fs_src=src, fs_root=root))
     assert outcome.status == "ok"
     assert (target / "0a" / "f1").read_bytes() == b"data"
-    assert not (target / "zz").exists()
+    assert not (target / "ab").exists()
     assert not (root / "odoo_staging").exists()
     assert outcome.filestore_files == 3
 
@@ -624,3 +632,126 @@ def test_drop_incomplete(secrets, ctx, local_conn):
     local_conn.production = True
     with pytest.raises(JobError, match="Production"):
         job.drop_incomplete(local_conn, "mydb")
+
+
+# --- fix round 1 ------------------------------------------------------------------------
+
+@pytest.mark.parametrize("result, message", [
+    ((0, "", ""), "Role odoo does not exist on the target"),
+    ((0, "f\n", ""), "The connection user cannot act as role odoo"),
+])
+def test_owner_role_checked_before_drop(secrets, ctx, local_conn, dump_file, result, message):
+    events = []
+    cap = FakeCapture(events, pg_has_role=result)
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    with pytest.raises(JobError, match=message):
+        job.execute(make_plan(dump_file, local_conn))
+    assert run.calls == []
+    sql = cap.called("pg_has_role")[0]
+    assert "from pg_roles where rolname = 'odoo'" in sql
+
+
+def test_pg_restore_fatal_exit_without_ignored_line_is_partial(secrets, ctx, local_conn,
+                                                               dump_file, tmp_path):
+    root = tmp_path / "filestore"
+    (root / "mydb" / "0a").mkdir(parents=True)
+    (root / "mydb" / "0a" / "old").write_bytes(b"old")
+    src = make_tar(tmp_path / "fs.tar", "mydb", ["0b/new"])
+    events = []
+    run = FakeRun(events, pg_restore=(1, [
+        "pg_restore: error: could not execute query: server closed the connection unexpectedly"],
+        False, ""))
+    job, cap, _, _ = make_job(secrets, ctx, run=run, events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn, fs_src=src, fs_root=root))
+    assert outcome.status == "partial" and outcome.errors == 1
+    assert not run.called("vacuumdb") and not cap.called("pg_tables")
+    assert (root / "mydb" / "0a" / "old").exists() and not (root / "mydb" / "0b").exists()
+    assert any("exit code 1" in w and "server closed the connection" in w
+               for w in outcome.warnings)
+
+
+def test_pg_restore_exit_0_with_racing_cancel_is_ok(secrets, ctx, local_conn, dump_file):
+    events = []
+    run = FakeRun(events, pg_restore=(0, [], True, ""))
+    job, _, _, _ = make_job(secrets, ctx, run=run, events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    assert outcome.status == "ok" and run.called("vacuumdb")
+
+
+def test_non_filestore_destination_refused(secrets, ctx, local_conn, dump_file, tmp_path):
+    root = tmp_path / "filestore"
+    (root / "mydb").mkdir(parents=True)
+    (root / "mydb" / "notes.txt").write_bytes(b"mine")
+    src = make_tar(tmp_path / "fs.tar", "mydb", ["0a/f1"])
+    job, _, run, _ = make_job(secrets, ctx)
+    with pytest.raises(JobError, match="does not look like an Odoo filestore"):
+        job.execute(make_plan(dump_file, local_conn, fs_src=src, fs_root=root))
+    assert run.calls == []
+    assert (root / "mydb" / "notes.txt").read_bytes() == b"mine"
+
+
+def test_cancel_during_dropdb_still_creates_and_skips_restore(secrets, ctx, local_conn,
+                                                             dump_file):
+    events = []
+
+    class CancellingRun(FakeRun):
+        def __call__(self, cmd, out_path, **kw):
+            result = super().__call__(cmd, out_path, **kw)
+            if "dropdb" in cmd.argv[0]:
+                ctx.cancel.cancel()  # user pressed Cancel while dropdb ran
+            return result
+
+    run = CancellingRun(events)
+    job, _, _, _ = make_job(secrets, ctx, run=run, events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    assert run.called("createdb") and not run.called("pg_restore")
+    assert outcome.status == "partial"
+    assert any("cancelled before the data restore" in w for w in outcome.warnings)
+
+
+def test_refusal_precedence(secrets, ctx, remote_conn, dump_file, tmp_path):
+    src = make_tar(tmp_path / "fs.tar", "mydb", ["0a/f1"])
+    job, _, _, events = make_job(secrets, ctx)
+    remote_conn.production = True
+    with pytest.raises(JobError, match="Production"):
+        job.execute(make_plan(dump_file, remote_conn, fs_src=src, fs_root=tmp_path / "fs"))
+    remote_conn.production = False
+    with pytest.raises(JobError, match="only be restored on this machine"):
+        job.execute(make_plan(dump_file, remote_conn, fs_src=src, fs_root=tmp_path / "fs"),
+                    confirmed_text="")
+    assert events == []
+
+
+def test_filestore_failure_after_delete_is_warning(secrets, ctx, local_conn, dump_file, tmp_path):
+    root = tmp_path / "filestore"
+    (root / "mydb" / "0a").mkdir(parents=True)
+    (root / "mydb" / "0a" / "old").write_bytes(b"old")
+    src = tmp_path / "bad.tar"
+    with tarfile.open(src, "w") as tf:
+        link = tarfile.TarInfo("mydb/0a/evil")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/passwd"
+        tf.addfile(link)
+    job, _, _, _ = make_job(secrets, ctx)
+    outcome = job.execute(make_plan(dump_file, local_conn, fs_src=src, fs_root=root))
+    assert outcome.status == "ok" and outcome.filestore_files == 0
+    assert not (root / "mydb" / "0a" / "old").exists()
+    assert any("Filestore restore failed" in w and "may be incomplete" in w
+               for w in outcome.warnings)
+    assert outcome.quick  # the quick check still runs
+
+
+def test_late_stderr_line_after_log_close_does_not_raise(secrets, ctx, local_conn, dump_file):
+    events = []
+
+    class KeepLineCallback(FakeRun):
+        def __call__(self, cmd, out_path, **kw):
+            if "pg_restore" in cmd.argv[0]:
+                self.on_line = kw.get("on_line")
+            return super().__call__(cmd, out_path, **kw)
+
+    run = KeepLineCallback(events)
+    job, _, _, _ = make_job(secrets, ctx, run=run, events=events)
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    run.on_line("pg_restore: late line from the reader thread")  # file already closed
+    assert outcome.status == "ok"

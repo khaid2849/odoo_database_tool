@@ -21,6 +21,8 @@ from .tools import ToolInfo, pg_major
 
 _TOOLS_HINT = "Install the PostgreSQL client tools or set the path in Settings."
 _ERROR_MARK = "pg_restore: error"
+# pg_restore prints this when it ran to the end despite errors; a non-zero exit without it is fatal.
+_IGNORED_MARK = "pg_restore: warning: errors ignored on restore:"
 _QUICK_SQL = (
     ("size", "select pg_database_size(current_database())"),
     ("tables", "select count(*) from pg_tables where schemaname='public'"),
@@ -124,8 +126,8 @@ def inspect_dump(path, pg_restore: Optional[ToolInfo], capture=run_capture) -> D
                     read_manifest(path.with_name(path.name + ".json")))
 
 
-def _sql_literal(db: str) -> str:
-    return "'" + validate_identifier(db, "database name").replace("'", "''") + "'"
+def _sql_literal(value: str, what: str = "database name") -> str:
+    return "'" + validate_identifier(value, what).replace("'", "''") + "'"
 
 
 def _unlink(path: Optional[Path]) -> None:
@@ -206,6 +208,7 @@ class RestoreJob:
                 busy = self._active(target, db, override)
                 if busy:
                     raise JobError(self._busy_message(db, busy))
+            self._check_owner(target, plan.owner, override)
             if not plan.dump.path.is_file():
                 raise JobError(f"Dump file not found: {plan.dump.path}")
             fs = self._prepare_filestore(plan)
@@ -219,12 +222,19 @@ class RestoreJob:
             except BaseException:
                 _unlink(log_path)
                 raise
+            failed_ext = self._create_extensions(plan, cmds, warnings)
+            if failed_ext:
+                _unlink(log_path)
+                return self._partial(db, None, 0, warnings,
+                                     f"extension {failed_ext} could not be created; no data "
+                                     "was restored")
             if self.ctx.cancel.cancelled:
                 _unlink(log_path)
                 return self._partial(db, None, 0, warnings, "cancelled before the data restore")
-            res, errors, error_lines = self._restore_data(plan, cmds.pg_restore, log_path,
-                                                          warnings)
-            reason = self._hard_failure(res)
+            res, error_lines, ignored = self._restore_data(plan, cmds.pg_restore, log_path,
+                                                           warnings)
+            errors = len(error_lines)
+            reason = self._hard_failure(res, ignored)
             if reason:
                 return self._partial(db, log_path, errors, warnings, reason)
             if res.rc != 0 or errors:
@@ -242,7 +252,10 @@ class RestoreJob:
         return RestoreOutcome("ok", errors, log_path, files, quick, warnings)
 
     def drop_incomplete(self, target: Connection, db: str) -> None:
-        """Drop a database left partial by a failed or cancelled restore."""
+        """Drop a database left partial by a failed or cancelled restore.
+
+        The caller must have obtained explicit user confirmation first.
+        """
         self._refuse_target(target)
         with self._session(target) as override:
             cmd = self._cmd(self.builder.dropdb, target, db, pg_override=override)
@@ -300,6 +313,10 @@ class RestoreJob:
             filestore.assert_safe_target(dest, root, plan.db)
         except ValueError as exc:
             raise JobError(f"Filestore: {exc}") from None
+        if os.path.lexists(dest) and not (dest.is_dir() and (
+                filestore.is_filestore_dir(dest) or not any(dest.iterdir()))):
+            raise JobError(f"{dest} exists and does not look like an Odoo filestore; "
+                           "refusing to delete it.")
         src_real, dest_real = Path(os.path.realpath(src)), Path(os.path.realpath(dest))
         if src_real == dest_real or dest_real in src_real.parents or src_real in dest_real.parents:
             raise JobError(f"Filestore: the source {src} overlaps the destination {dest}.")
@@ -340,19 +357,25 @@ class RestoreJob:
         self.ctx.log(f"Creating {db}")
         self._step(cmds.createdb, "createdb",
                    "Nothing was created." if plan.is_new else f"{db} was dropped and not recreated.")
+
+    def _create_extensions(self, plan: RestorePlan, cmds: _Commands, warnings: list) -> str:
+        """Pre-create the dump's extensions; returns the first one that failed, or ""."""
         for ext, cmd in cmds.extensions:
             self.ctx.log(f"Creating extension {ext}")
             rc, _out, err = self._capture(cmd, timeout=300, redactor=self.ctx.redactor)
             if rc != 0:
-                raise JobError(
-                    f"Cannot create extension {ext} in {db}: {self._red(last_line(err)) or f'exit {rc}'}. "
-                    f"The user {plan.target.pg.user or '(default)'} lacks the privilege to create "
-                    "it: connect as a superuser or ask an admin to create it. No data was "
-                    f"restored; {db} exists and is empty.")
+                self._warn(warnings, f"Could not create extension {ext}: the connection user may "
+                                     "lack the privilege, or the extension is not installed on "
+                                     f"the server. {self._red(last_line(err)) or f'exit {rc}'}")
+                return ext
+        return ""
 
     def _restore_data(self, plan: RestorePlan, cmd: Cmd, log_path: Path,
                       warnings: list) -> tuple:
-        """Run pg_restore with its stderr in the log; returns (result, errors, error lines)."""
+        """Run pg_restore with its stderr in the log; returns (result, error lines, ignored).
+
+        `ignored` is True when pg_restore reported that it carried on past its errors.
+        """
         self.ctx.progress(None, "Restoring data…")
         self.ctx.log(f"Restoring {plan.dump.path.name} into {plan.db} (log: {log_path})")
         log_failed = []
@@ -362,8 +385,8 @@ class RestoreJob:
                 if not log_failed:
                     try:
                         fh.write(line + "\n")
-                    except OSError as exc:
-                        log_failed.append(exc.strerror or str(exc))
+                    except (OSError, ValueError) as exc:  # ValueError: line after close
+                        log_failed.append(getattr(exc, "strerror", None) or str(exc))
                 self.ctx.log(line)
 
             res = self._run(cmd, None, on_line=on_line, cancel=self.ctx.cancel,
@@ -377,18 +400,24 @@ class RestoreJob:
         except OSError:
             text = "\n".join(res.stderr_tail)
         error_lines = [ln for ln in text.splitlines() if _ERROR_MARK in ln]
-        return res, len(error_lines), error_lines
+        ignored = _IGNORED_MARK in text or any(_IGNORED_MARK in ln for ln in res.stderr_tail)
+        return res, error_lines, ignored
 
-    def _hard_failure(self, res: RunResult) -> str:
+    def _hard_failure(self, res: RunResult, ignored: bool) -> str:
         """Why pg_restore did not run to completion, or "" when it did."""
-        if res.cancelled or self.ctx.cancel.cancelled:
-            return "cancelled during the data restore"
         if res.error:
             return f"pg_restore could not run: {self._red(res.error)}"
+        if res.rc == 0:  # finished; a cancel that raced the exit does not undo that
+            return ""
+        if res.cancelled:
+            return "cancelled during the data restore"
         if res.rc == 127:
             return "pg_restore could not start (exit 127)"
         if res.rc < 0:
             return f"pg_restore was killed (signal {-res.rc})"
+        if not ignored:
+            last = self._red(last_line(res.stderr_tail))
+            return f"pg_restore stopped with exit code {res.rc}" + (f": {last}" if last else "")
         return ""
 
     def _partial(self, db: str, log_path: Optional[Path], errors: int, warnings: list,
@@ -473,9 +502,10 @@ class RestoreJob:
 
     def _active(self, target: Connection, db: str, override: PgOverride) -> list:
         sql = ("select pid, coalesce(application_name,''), usename, "
-               "coalesce(client_addr::text,'local'), to_char(backend_start,'HH24:MI') "
+               "coalesce(client_addr::text,'local'), "
+               "to_char(backend_start,'YYYY-MM-DD HH24:MI') "
                f"from pg_stat_activity where datname = {_sql_literal(db)} "
-               "and pid <> pg_backend_pid()")
+               "and pid <> pg_backend_pid() and backend_type = 'client backend'")
         rc, out, err = self._psql(target, "postgres", sql, override)
         if rc != 0:
             raise JobError(f"Cannot check connections to {db}: {last_line(err) or f'exit {rc}'}.")
@@ -488,6 +518,19 @@ class RestoreJob:
             rows.append(Activity(int(parts[0]), "|".join(parts[1:-3]), parts[-3], parts[-2],
                                  parts[-1].strip()))
         return rows
+
+    def _check_owner(self, target: Connection, owner: str, override: PgOverride) -> None:
+        """Refuse before anything is touched if the connection user cannot act as owner."""
+        sql = ("select rolname = current_user or pg_has_role(current_user, rolname, 'MEMBER') "
+               f"from pg_roles where rolname = {_sql_literal(owner, 'owner role')}")
+        rc, out, err = self._psql(target, "postgres", sql, override)
+        if rc != 0:
+            raise JobError(f"Cannot check role {owner}: {last_line(err) or f'exit {rc}'}.")
+        value = out.strip()
+        if not value:
+            raise JobError(f"Role {owner} does not exist on the target.")
+        if value != "t":
+            raise JobError(f"The connection user cannot act as role {owner}.")
 
     def _size_text(self, target: Connection, db: str) -> str:
         try:
