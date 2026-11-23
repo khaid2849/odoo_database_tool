@@ -123,6 +123,16 @@ def test_askpass_main_prints_secret(capsys):
     assert capsys.readouterr().out == "s3cr3t\n"
 
 
+def test_askpass_main_without_stdout_writes_fd1(monkeypatch):
+    backend = FakeBackend()
+    Secrets(backend).set("c1", "ssh_password", "s3cr3t")
+    written = []
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(store.os, "write", lambda fd, data: written.append((fd, data)) or len(data))
+    assert askpass_main({ASKPASS_ENV: "c1:ssh_password"}, backend=backend) == 0
+    assert written == [(1, b"s3cr3t\n")]
+
+
 def test_askpass_main_missing(capsys):
     assert askpass_main({ASKPASS_ENV: "c1:ssh_password"}, backend=FakeBackend()) == 1
     assert askpass_main({}, backend=FakeBackend()) == 1
@@ -133,7 +143,8 @@ def test_askpass_main_missing(capsys):
 def test_askpass_program_writes_wrapper_once(monkeypatch):
     monkeypatch.delattr(sys, "frozen", raising=False)
     path = store.askpass_program()
-    text = open(path).read()
+    with open(path) as fh:
+        text = fh.read()
     assert text == f'#!/bin/sh\nexec "{sys.executable}" -m odoo_database_tool "$@"\n'
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o700
     mtime = os.stat(path).st_mtime_ns

@@ -6,10 +6,12 @@ import os
 import sys
 
 from . import __version__
+from .common import reset_frozen_dll_directory
 from .store import ASKPASS_ENV, askpass_main
 
 
 def main(argv: list[str] | None = None) -> None:
+    reset_frozen_dll_directory()
     # SSH_ASKPASS mode: ssh passes the prompt as the only argument; no argparse or Qt.
     if ASKPASS_ENV in os.environ:
         sys.exit(askpass_main(os.environ))

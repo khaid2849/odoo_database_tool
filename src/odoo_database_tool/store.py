@@ -164,6 +164,9 @@ def askpass_main(env, backend=None) -> int:
     value = Secrets(backend).get(conn_id, field)
     if not value:
         return 1
+    if sys.stdout is None:  # frozen windowed build: no Python stdout, but fd 1 is ssh's pipe
+        os.write(1, (value + "\n").encode())
+        return 0
     sys.stdout.write(value + "\n")
     sys.stdout.flush()
     return 0

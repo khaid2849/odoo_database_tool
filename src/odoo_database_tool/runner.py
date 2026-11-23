@@ -1,7 +1,6 @@
 """Run external commands: stream stdout to a file, stderr to a log callback, with cancel."""
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import threading
@@ -10,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .common import child_env
 from .ssh import Cmd
 
 CHUNK = 1024 * 1024
@@ -64,8 +64,7 @@ class RunResult:
 
 
 def _popen(cmd: Cmd) -> subprocess.Popen:
-    env = dict(os.environ)
-    env.update(cmd.env)
+    env = child_env(cmd.env)
     kwargs = {}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW

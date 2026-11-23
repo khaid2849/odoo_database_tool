@@ -12,6 +12,27 @@ ORG_NAME = "khaid2849"
 BUILD_NAME = "OdooDatabaseTool"
 
 
+def child_env(extra: dict | None = None) -> dict:
+    """Environment for every child process: ours, minus frozen-build library paths, plus extra."""
+    env = dict(os.environ)
+    if getattr(sys, "frozen", False) and sys.platform.startswith("linux"):
+        # PyInstaller points LD_LIBRARY_PATH at its bundle; system tools need the original.
+        original = env.get("LD_LIBRARY_PATH_ORIG")
+        if original is not None:
+            env["LD_LIBRARY_PATH"] = original
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    env.update(extra or {})
+    return env
+
+
+def reset_frozen_dll_directory() -> None:
+    """Frozen Windows build: undo PyInstaller's SetDllDirectory so child processes use their own DLLs."""
+    if getattr(sys, "frozen", False) and sys.platform == "win32":
+        import ctypes
+        ctypes.windll.kernel32.SetDllDirectoryW(None)
+
+
 def odoo_data_dir(platform: str | None = None) -> Path:
     """Odoo's per-user data dir (holds filestore/<db>) for the given or current OS."""
     platform = platform or sys.platform

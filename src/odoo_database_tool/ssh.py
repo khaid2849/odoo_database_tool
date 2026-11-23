@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .common import child_env
 from .models import SshTarget
 from .store import ASKPASS_ENV, askpass_program
 from .tools import parse_openssh_version
@@ -30,7 +31,7 @@ def openssh_version(ssh_bin: str) -> tuple[int, int] | None:
     """Version reported by `ssh -V`, or None if it cannot run."""
     try:
         r = subprocess.run([ssh_bin, "-V"], capture_output=True, text=True,
-                           timeout=5, **_NO_WINDOW)
+                           timeout=5, env=child_env(), **_NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
         return None
     return parse_openssh_version((r.stdout or "") + (r.stderr or ""))
@@ -75,7 +76,7 @@ def ssh_cmd(ssh_bin: str, t: SshTarget, remote: str, *, conn_id: str,
 
 def _run(argv: list[str], input_text: str | None = None, timeout: int = 20):
     return subprocess.run(argv, input=input_text, capture_output=True, text=True,
-                          timeout=timeout, **_NO_WINDOW)
+                          timeout=timeout, env=child_env(), **_NO_WINDOW)
 
 
 def _sibling_tool(ssh_bin: str, name: str) -> str:
@@ -210,14 +211,17 @@ class Tunnel:
         argv = ssh_argv(self.ssh_bin, self.t, extra=[
             "-N", "-o", "ExitOnForwardFailure=yes",
             "-L", forward_spec(self.local_port, self.remote_host, self.remote_port)])
-        env = dict(os.environ)
-        if self.t.use_password:
-            env.update(askpass_env(self.conn_id, self.secret_field))
+        env = child_env(askpass_env(self.conn_id, self.secret_field)
+                        if self.t.use_password else None)
         # stderr goes to a file: an undrained pipe could block ssh during long dumps
         self._err = tempfile.TemporaryFile()
-        self._proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
-                                      stdout=subprocess.DEVNULL, stderr=self._err,
-                                      **_NO_WINDOW)
+        try:
+            self._proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                                          stdout=subprocess.DEVNULL, stderr=self._err,
+                                          **_NO_WINDOW)
+        except BaseException:
+            self._stop()
+            raise
         try:
             self._wait_ready()
         except BaseException:
@@ -250,9 +254,7 @@ class Tunnel:
 
     def _stop(self) -> None:
         p = self._proc
-        if p is None:
-            return
-        if p.poll() is None:
+        if p is not None and p.poll() is None:
             p.terminate()
             try:
                 p.wait(5)

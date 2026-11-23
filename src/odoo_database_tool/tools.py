@@ -9,6 +9,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .common import child_env
+
 PG_TOOLS = ("pg_dump", "pg_restore", "psql", "createdb", "dropdb", "vacuumdb")
 
 # Install-dir globs per platform (spec 9.3); module-level so tests can patch them.
@@ -91,7 +93,7 @@ def _run_version(path: str, flag: str) -> str | None:
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
         r = subprocess.run([path, flag], capture_output=True, text=True,
-                           timeout=_TIMEOUT, **kwargs)
+                           timeout=_TIMEOUT, env=child_env(), **kwargs)
     except (OSError, subprocess.SubprocessError):
         return None
     return (r.stdout or "") + (r.stderr or "")
