@@ -179,6 +179,14 @@ def reason_text(kind: str) -> str:
     return _REASONS.get(kind, "the SSH command failed")
 
 
+def forward_spec(local_port: int, host: str, port: int) -> str:
+    """`-L` value on 127.0.0.1; an IPv6 remote host is bracketed."""
+    host = host.strip()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"127.0.0.1:{local_port}:{host}:{port}"
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -201,7 +209,7 @@ class Tunnel:
         self.local_port = _free_port()
         argv = ssh_argv(self.ssh_bin, self.t, extra=[
             "-N", "-o", "ExitOnForwardFailure=yes",
-            "-L", f"127.0.0.1:{self.local_port}:{self.remote_host}:{self.remote_port}"])
+            "-L", forward_spec(self.local_port, self.remote_host, self.remote_port)])
         env = dict(os.environ)
         if self.t.use_password:
             env.update(askpass_env(self.conn_id, self.secret_field))

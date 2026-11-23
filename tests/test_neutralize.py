@@ -147,3 +147,58 @@ def test_opens_tunnel_when_needed(secrets, ctx, tmp_path):
     res = go(secrets, ctx, c, tree(tmp_path), run=run, tunnel_factory=FakeTunnel)
     assert res.ok and len(FakeTunnel.opened) == 1 and FakeTunnel.opened[0].closed
     assert "55432" in " ".join(run.calls[0])
+
+
+# --- final review fixes ------------------------------------------------------------------
+
+class HostCapture(FakeCapture):
+    def __init__(self, host, **kw):
+        super().__init__(**kw)
+        self.host = host
+
+    def __call__(self, cmd, *, timeout=60, redactor=None):
+        joined = " ".join(cmd.argv)
+        if joined.endswith(" hostname"):
+            self.calls.append(joined)
+            return 0, self.host + "\n", ""
+        return super().__call__(cmd, timeout=timeout, redactor=redactor)
+
+
+def tunnelled(expected="db-box"):
+    from odoo_database_tool.models import SshTarget
+    c = Connection.new("Staging PG", Kind.POSTGRES)
+    c.pg.host, c.pg.user = "10.0.0.5", "odoo"
+    c.tunnel = SshTarget(host="jump", user="u", expected_hostname=expected)
+    return c
+
+
+def test_expected_hostname_mismatch_never_runs_psql(secrets, ctx, tmp_path):
+    FakeTunnel.opened.clear()
+    run, cap = FakeRun(), HostCapture("clone-box")
+    res = go(secrets, ctx, tunnelled(), tree(tmp_path), capture=cap, run=run,
+             tunnel_factory=FakeTunnel)
+    assert not res.ok and "clone-box" in res.reason and "db-box" in res.reason
+    assert run.calls == [] and FakeTunnel.opened == []
+    assert len(cap.calls) == 1 and cap.calls[0].endswith(" hostname")
+
+
+def test_expected_hostname_match_neutralizes(secrets, ctx, tmp_path):
+    run, cap = FakeRun(), HostCapture("db-box")
+    res = go(secrets, ctx, tunnelled(), tree(tmp_path), capture=cap, run=run,
+             tunnel_factory=FakeTunnel)
+    assert res.ok and cap.calls[0].endswith(" hostname") and len(run.calls) == 1
+
+
+def test_missing_module_folders_reported_separately(secrets, ctx, local_conn, tmp_path):
+    sets = tree(tmp_path)
+    (tmp_path / "addons" / "web").mkdir()  # present, but without neutralize.sql
+    cap = FakeCapture(modules="base\nmail\nweb\nnot_there\ncustom_x\n")
+    res = go(secrets, ctx, local_conn, sets, capture=cap)
+    assert res.ok and len(res.files) == 2
+    assert res.missing == ["custom_x", "not_there"]
+    assert any("not_there" in line for line in ctx.events["log"])
+
+
+def test_no_missing_modules_by_default(secrets, ctx, local_conn, tmp_path):
+    res = go(secrets, ctx, local_conn, tree(tmp_path), capture=FakeCapture(modules="base\nmail\n"))
+    assert res.ok and res.missing == []

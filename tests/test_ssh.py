@@ -133,3 +133,14 @@ def test_tunnel_password_uses_tunnel_secret_field(tmp_path):
     with Tunnel(fake, SshTarget(host="h", use_password=True), "c9", "db", 5432):
         pass
     assert out.read_text() == "c9:tunnel_password"
+
+
+@pytest.mark.parametrize("host,spec", [
+    ("db.internal", "127.0.0.1:5000:db.internal:5432"),
+    ("10.0.0.5", "127.0.0.1:5000:10.0.0.5:5432"),
+    ("::1", "127.0.0.1:5000:[::1]:5432"),
+    ("fd00::5", "127.0.0.1:5000:[fd00::5]:5432"),
+    ("[fd00::5]", "127.0.0.1:5000:[fd00::5]:5432"),
+])
+def test_forward_spec_brackets_ipv6(host, spec):
+    assert ssh.forward_spec(5000, host, 5432) == spec

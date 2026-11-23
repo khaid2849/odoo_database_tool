@@ -13,7 +13,7 @@ from . import filestore
 from .archive import Manifest, TocInfo, lookup_sha256, parse_toc, read_manifest, sha256_file
 from .common import timestamp
 from .jobs import (LIST_DATABASES_SQL, JobContext, JobError, human_bytes, last_line,
-                   open_tunnel, parse_database_sizes, register_secrets)
+                   open_tunnel, parse_database_sizes, register_secrets, require_expected_hostname)
 from .models import Connection, is_local_target, validate_identifier
 from .runner import RunResult, run_capture, run_stream
 from .ssh import Cmd, Tunnel
@@ -193,7 +193,7 @@ class RestoreJob:
                      f"{plan.jobs} parallel jobs, then analyze.")
         lines.append(self._filestore_summary(plan))
         if not is_local_target(t):
-            lines.append(f"{t.name} is a remote server: type {db} to confirm.")
+            lines.append(f"{t.name} is a remote server, not this machine.")
         return lines
 
     # --- restore ---------------------------------------------------------------------
@@ -222,33 +222,47 @@ class RestoreJob:
             except BaseException:
                 _unlink(log_path)
                 raise
-            failed_ext = self._create_extensions(plan, cmds, warnings)
-            if failed_ext:
-                _unlink(log_path)
-                return self._partial(db, None, 0, warnings,
-                                     f"extension {failed_ext} could not be created; no data "
-                                     "was restored")
-            if self.ctx.cancel.cancelled:
-                _unlink(log_path)
-                return self._partial(db, None, 0, warnings, "cancelled before the data restore")
-            res, error_lines, ignored = self._restore_data(plan, cmds.pg_restore, log_path,
-                                                           warnings)
-            errors = len(error_lines)
-            reason = self._hard_failure(res, ignored)
-            if reason:
-                return self._partial(db, log_path, errors, warnings, reason)
-            if res.rc != 0 or errors:
-                self._warn(warnings, f"pg_restore finished with exit code {res.rc} and {errors} "
-                                     f"error line(s); see {log_path.name}. First ones:\n"
-                                     + "\n".join(error_lines[:5]))
-            self._vacuum(target, db, override, warnings)
-            files = self._restore_filestore(fs, warnings) if fs else 0
-            if fs is None:
-                self._note_kept_filestore(plan, warnings)
-            self.ctx.progress(None, "Checking the restored database…")
-            quick = self._quick(target, db, plan.dump.toc, override)
+            try:
+                outcome = self._after_recreate(plan, cmds, fs, log_path, override, warnings)
+            except Exception as exc:  # noqa: BLE001 - the DB exists again: never strand it silently
+                detail = self._red(str(exc)) or type(exc).__name__
+                return self._partial(db, log_path if log_path.exists() else None, 0, warnings,
+                                     "Restore stopped unexpectedly after the database was "
+                                     f"recreated: {detail}")
+            if outcome.status != "ok":
+                return outcome
         self.ctx.progress(100, "Done")
         self.ctx.log(f"Restore of {db} finished.")
+        return outcome
+
+    def _after_recreate(self, plan: RestorePlan, cmds: _Commands, fs: Optional[tuple],
+                        log_path: Path, override: PgOverride, warnings: list) -> RestoreOutcome:
+        """Extensions, data, analyze, filestore and quick check once the DB exists again."""
+        target, db = plan.target, plan.db
+        failed_ext = self._create_extensions(plan, cmds, warnings)
+        if failed_ext:
+            _unlink(log_path)
+            return self._partial(db, None, 0, warnings,
+                                 f"extension {failed_ext} could not be created; no data "
+                                 "was restored")
+        if self.ctx.cancel.cancelled:
+            _unlink(log_path)
+            return self._partial(db, None, 0, warnings, "cancelled before the data restore")
+        res, error_lines, ignored = self._restore_data(plan, cmds.pg_restore, log_path, warnings)
+        errors = len(error_lines)
+        reason = self._hard_failure(res, ignored)
+        if reason:
+            return self._partial(db, log_path, errors, warnings, reason)
+        if res.rc != 0 or errors:
+            self._warn(warnings, f"pg_restore finished with exit code {res.rc} and {errors} "
+                                 f"error line(s); see {log_path.name}. First ones:\n"
+                                 + "\n".join(error_lines[:5]))
+        self._vacuum(target, db, override, warnings)
+        files = self._restore_filestore(fs, warnings) if fs else 0
+        if fs is None:
+            self._note_kept_filestore(plan, warnings)
+        self.ctx.progress(None, "Checking the restored database…")
+        quick = self._quick(target, db, plan.dump.toc, override)
         return RestoreOutcome("ok", errors, log_path, files, quick, warnings)
 
     def drop_incomplete(self, target: Connection, db: str) -> None:
@@ -555,8 +569,9 @@ class RestoreJob:
 
     @contextmanager
     def _session(self, target: Connection) -> Iterator[PgOverride]:
-        """Secrets registered and, for a tunnelled target, the tunnel open for the block."""
+        """Expected hostname checked, secrets registered and the tunnel (if any) open."""
         self._register(target)
+        require_expected_hostname(self.builder, target, self._capture, self.ctx.redactor)
         with ExitStack() as stack:
             try:
                 override = open_tunnel(stack, self._tunnel_factory, self.builder.ssh_bin, target)

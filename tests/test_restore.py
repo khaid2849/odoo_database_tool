@@ -755,3 +755,79 @@ def test_late_stderr_line_after_log_close_does_not_raise(secrets, ctx, local_con
     outcome = job.execute(make_plan(dump_file, local_conn))
     run.on_line("pg_restore: late line from the reader thread")  # file already closed
     assert outcome.status == "ok"
+
+
+# --- final review fixes ------------------------------------------------------------------
+
+def tunnelled_conn(expected="db-box"):
+    conn = Connection.new("rds", Kind.POSTGRES)
+    conn.pg.host, conn.pg.user = "db.internal", "odoo"
+    conn.tunnel = SshTarget(alias="bastion", expected_hostname=expected)
+    return conn
+
+
+def test_expected_hostname_mismatch_refuses_execute_before_anything(secrets, ctx, dump_file):
+    events = []
+    cap = FakeCapture(events, hostname=(0, "clone-box\n", ""))
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    with pytest.raises(JobError, match="clone-box.*db-box"):
+        job.execute(make_plan(dump_file, tunnelled_conn()), confirmed_text="mydb")
+    assert run.calls == [] and FakeTunnel.opened == []
+    assert [e for e in events if "hostname" not in e] == []  # nothing but the hostname check
+    assert not list(dump_file.parent.glob("restore_*.log"))
+
+
+def test_expected_hostname_mismatch_refuses_drop_and_queries(secrets, ctx):
+    events = []
+    cap = FakeCapture(events, hostname=(0, "clone-box\n", ""))
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    conn = tunnelled_conn()
+    with pytest.raises(JobError, match="expected 'db-box'"):
+        job.drop_incomplete(conn, "mydb")
+    for call in (lambda: job.list_databases(conn), lambda: job.db_locale(conn, "mydb"),
+                 lambda: job.active_connections(conn, "mydb"),
+                 lambda: job.quick_check(conn, "mydb", parse_toc(TOC))):
+        with pytest.raises(JobError, match="clone-box"):
+            call()
+    assert run.calls == [] and FakeTunnel.opened == []
+    assert all("hostname" in e for e in events)
+
+
+def test_expected_hostname_match_runs_hostname_first(secrets, ctx, dump_file):
+    events = []
+    cap = FakeCapture(events, hostname=(0, "db-box\n", ""))
+    job, _, run, _ = make_job(secrets, ctx, capture=cap, events=events)
+    outcome = job.execute(make_plan(dump_file, tunnelled_conn()), confirmed_text="mydb")
+    assert outcome.status == "ok"
+    assert "hostname" in events[0] and "bastion" in events[0]
+    assert run.called("dropdb")
+
+
+def test_no_expected_hostname_skips_check(secrets, ctx, dump_file):
+    job, cap, _, _ = make_job(secrets, ctx)
+    assert job.execute(make_plan(dump_file, tunnelled_conn("")), confirmed_text="mydb").status == "ok"
+    assert not cap.called("hostname")
+
+
+def test_unexpected_error_after_recreate_is_partial(secrets, ctx, local_conn, dump_file):
+    secrets.set(local_conn.id, "pg_password", "pg-secret")
+    job, _, run, _ = make_job(secrets, ctx)
+
+    def broken(*args, **kwargs):
+        raise OSError(28, "No space left on device pg-secret")
+
+    job._restore_data = broken
+    outcome = job.execute(make_plan(dump_file, local_conn))
+    assert outcome.status == "partial"
+    assert run.called("createdb") and not run.called("vacuumdb")
+    text = "\n".join(outcome.warnings)
+    assert "Restore stopped unexpectedly after the database was recreated" in text
+    assert "No space left on device" in text and "pg-secret" not in text
+    assert "mydb is partial" in text
+
+
+def test_summary_remote_has_no_typed_confirmation_line(secrets, ctx, remote_conn, dump_file):
+    job, _, _, _ = make_job(secrets, ctx)
+    lines = job.summary(make_plan(dump_file, remote_conn))
+    assert any("remote server" in line for line in lines)
+    assert not any("to confirm" in line for line in lines)

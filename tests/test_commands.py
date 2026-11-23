@@ -218,6 +218,25 @@ def test_ssh_host_pg_os_user_local_host_uses_socket(builder, host_conn):
     assert " -p 5433 " in builder.psql(host_conn, "db1", "select 1").argv[-1]
 
 
+def test_ssh_host_pg_os_user_socket_dir_keeps_h(builder, host_conn):
+    host_conn.pg_os_user = "postgres"
+    host_conn.pg.host = "/var/run/postgresql"
+    r = builder.psql(host_conn, "db1", "select 1").argv[-1]
+    assert " -h /var/run/postgresql " in r
+
+
+def test_list_containers_docker(builder, docker_conn):
+    c = builder.list_containers(docker_conn)
+    assert c.argv[-1] == "docker ps --format '{{.Names}}'" and c.argv[-2] == "my-server"
+    docker_conn.ssh.use_sudo = True
+    assert builder.list_containers(docker_conn).argv[-1] == "sudo -n docker ps --format '{{.Names}}'"
+
+
+def test_list_containers_only_for_docker(builder, host_conn):
+    with pytest.raises(ValueError, match="SSH \\+ host Postgres"):
+        builder.list_containers(host_conn)
+
+
 def test_ssh_host_pg_os_user_remote_host_keeps_h(builder, host_conn):
     host_conn.pg_os_user = "postgres"
     host_conn.pg.host = "10.0.0.5"

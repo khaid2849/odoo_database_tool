@@ -61,13 +61,14 @@ def test_destination():
     assert SshTarget(host="h").destination() == "h"
 
 
+@pytest.mark.parametrize("kind", [Kind.POSTGRES, Kind.LOCAL])
 @pytest.mark.parametrize("host,tunnel,expected", [
     ("localhost", False, True), ("127.0.0.1", False, True), ("::1", False, True),
     ("", False, True), ("/tmp", False, True), ("localhost", True, False),
-    ("10.0.0.5", False, False),
+    ("10.0.0.5", False, False), ("db.example.com", False, False),
 ])
-def test_is_local_target(host, tunnel, expected):
-    c = Connection.new("p", Kind.POSTGRES)
+def test_is_local_target(kind, host, tunnel, expected):
+    c = Connection.new("p", kind)
     c.pg = PgEndpoint(host=host)
     if tunnel:
         c.tunnel = SshTarget(host="jump")
@@ -106,3 +107,29 @@ def test_validate_connection_ok_and_bad_values():
     c.container = "bad name;"
     assert any("container" in e.lower() for e in validate_connection(c))
     assert any("name" in e.lower() for e in validate_connection(Connection.new("", Kind.LOCAL)))
+
+
+@pytest.mark.parametrize("host,ok", [("localhost", True), ("", True), ("127.0.0.1", True),
+                                     ("::1", True), ("/var/run/postgresql", True),
+                                     ("10.0.0.5", False), ("db.example.com", False)])
+def test_validate_local_connection_host(host, ok):
+    c = Connection.new("l", Kind.LOCAL)
+    c.pg.host = host
+    errors = validate_connection(c)
+    assert (errors == []) is ok
+    if not ok:
+        assert any("Direct Postgres" in e for e in errors)
+
+
+@pytest.mark.parametrize("field", ["host", "alias", "proxy_jump"])
+def test_validate_rejects_ssh_values_starting_with_dash(field):
+    c = Connection.new("x", Kind.SSH_DOCKER)
+    c.container = "odoo"
+    c.ssh.host = "h"
+    setattr(c.ssh, field, "-oProxyCommand=evil")
+    assert any("must not start with '-'" in e for e in validate_connection(c))
+    p = Connection.new("p", Kind.POSTGRES)
+    p.pg.host = "db"
+    p.tunnel = SshTarget(host="jump")
+    setattr(p.tunnel, field, " -x")
+    assert any("SSH tunnel" in e and "'-'" in e for e in validate_connection(p))

@@ -15,8 +15,8 @@ from typing import NoReturn, Optional, Tuple
 from . import filestore
 from .archive import (Manifest, append_sha256sums, dump_filename, filestore_filename,
                       parse_toc, sha256_file, write_manifest)
-from .jobs import (LIST_DATABASES_SQL, Check, JobContext, JobError, human_bytes, last_line,
-                   open_tunnel, parse_database_sizes, register_secrets)
+from .jobs import (LIST_DATABASES_SQL, SSH_HINTS, Check, JobContext, JobError, check_hostname,
+                   human_bytes, last_line, open_tunnel, parse_database_sizes, register_secrets)
 from .models import Connection, Kind, validate_identifier
 from .runner import RunResult, run_capture, run_stream
 from .ssh import Cmd, Tunnel, classify_ssh_error, reason_text
@@ -25,13 +25,7 @@ from .tools import parse_pg_version, pg_major
 _SSH_KINDS = (Kind.SSH_DOCKER, Kind.SSH_HOST)
 _INFO_SQL = "select current_setting('server_version'), pg_database_size(current_database())"
 _ODOO_SQL = "select latest_version from ir_module_module where name='base'"
-_SSH_HINTS = {
-    "host_key_changed": "The SSH host key has changed. Check with the server admin before connecting.",
-    "host_key_unknown": "The SSH host key is not trusted yet. Use Test on the Connections tab to accept it.",
-    "auth_failed": "SSH authentication failed: check the key, agent or password.",
-    "unreachable": "Cannot SSH: VPN/whitelist/key?",
-    "connection_lost": "The SSH connection was lost. Check the network and retry.",
-}
+_SSH_HINTS = SSH_HINTS
 _TOOLS_HINT = "Install the PostgreSQL client tools or set the path in Settings."
 _CANCELLED = "Cancelled. The partial file was deleted."
 
@@ -74,6 +68,15 @@ def _unlink(path: Path) -> None:
         path.unlink()
     except OSError:
         pass
+
+
+def _free_name(dest: Path, name: str, ext: str) -> Path:
+    """dest/name, or dest/<stem>-2<ext>, -3… when the file (or its .part) already exists."""
+    stem = name[:-len(ext)]
+    path, n = dest / name, 2
+    while path.exists() or _sibling(path, ".part").exists():
+        path, n = dest / f"{stem}-{n}{ext}", n + 1
+    return path
 
 
 def _existing_parent(path: Path) -> Path:
@@ -257,20 +260,7 @@ class DumpJob:
         return checks, facts
 
     def _check_hostname(self, conn: Connection, expected: str = "") -> Check:
-        name = "Hostname"
-        try:
-            rc, out, err = self._capture_cmd(self.builder.hostname(conn), timeout=30)
-        except ValueError as exc:
-            return Check(name, False, str(exc))
-        if rc != 0:
-            return Check(name, False, f"Cannot run hostname: {self._failure(conn, rc, err, ssh=True)}",
-                         self._hint(conn, rc, err, "Check the SSH settings of this connection.",
-                                    ssh=True))
-        actual = out.strip()
-        if expected and actual != expected:
-            return Check(name, False, f"The machine is '{actual}', expected '{expected}'.",
-                         "Wrong machine? Check the SSH host/alias and the expected hostname.")
-        return Check(name, True, actual)
+        return check_hostname(self.builder, conn, self._capture, self.ctx.redactor, expected)
 
     def _check_container(self, conn: Connection) -> Check:
         name = "Container"
@@ -406,7 +396,7 @@ class DumpJob:
     def _dump_db(self, opts: DumpOptions, facts: _Facts, dest: Path, now: datetime,
                  warnings: list[str]) -> Path:
         conn = opts.conn
-        out = dest / dump_filename(opts.db, conn.name, now)
+        out = _free_name(dest, dump_filename(opts.db, conn.name, now), ".dump")
         part, log = _sibling(out, ".part"), _sibling(out, ".log")
         try:
             cmd = self.builder.dump_db(conn, opts.db, pg_override=facts.pg_override)
@@ -455,7 +445,8 @@ class DumpJob:
     def _dump_filestore(self, opts: DumpOptions, facts: _Facts, dest: Path, now: datetime,
                         warnings: list[str]) -> Path:
         conn = opts.conn
-        out = dest / filestore_filename(opts.db, conn.name, opts.gzip, now)
+        out = _free_name(dest, filestore_filename(opts.db, conn.name, opts.gzip, now),
+                         ".tar.gz" if opts.gzip else ".tar")
         part, log = _sibling(out, ".part"), _sibling(out, ".log")
         total = facts.fs_kb * 1024
 
@@ -607,15 +598,15 @@ class DumpJob:
     def _red(self, text: str) -> str:
         return self.ctx.redactor(text)
 
-    def _failure(self, conn: Connection, rc: int, err: str, ssh: bool = False) -> str:
-        kind = classify_ssh_error(err, rc) if ssh or conn.kind in _SSH_KINDS else None
+    def _failure(self, conn: Connection, rc: int, err: str) -> str:
+        kind = classify_ssh_error(err, rc) if conn.kind in _SSH_KINDS else None
         if kind:
             return reason_text(kind)
         return self._red(last_line(err)) or f"exit code {rc}"
 
     @staticmethod
-    def _hint(conn: Connection, rc: int, err: str, default: str, ssh: bool = False) -> str:
-        kind = classify_ssh_error(err, rc) if ssh or conn.kind in _SSH_KINDS else None
+    def _hint(conn: Connection, rc: int, err: str, default: str) -> str:
+        kind = classify_ssh_error(err, rc) if conn.kind in _SSH_KINDS else None
         return _SSH_HINTS.get(kind or "", default)
 
     def _write_log(self, path: Path, lines: list[str]) -> None:

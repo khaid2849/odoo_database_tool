@@ -155,7 +155,8 @@ def tar_directory(root: Path, db: str, out: Path, gzip: bool,
     tf = tarfile.open(out, "w:gz" if gzip else "w")
     try:
         with tf:
-            tf.add(base, arcname=db, recursive=False)
+            # a symlinked <db> folder must still be a directory entry, or extraction refuses it
+            tf.add(base.resolve() if base.is_symlink() else base, arcname=db, recursive=False)
             for dirpath, dirnames, files in os.walk(base):
                 dirnames[:] = sorted(d for d in dirnames if not (Path(dirpath) / d).is_symlink())
                 rel = Path(dirpath).relative_to(base)

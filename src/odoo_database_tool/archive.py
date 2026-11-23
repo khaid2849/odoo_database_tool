@@ -13,7 +13,8 @@ from .common import slugify, timestamp
 
 SUMS_FILE = "SHA256SUMS"
 _TS = r"(\d{8}-\d{4})"
-_DUMP_RE = re.compile(r"^(?P<db>.+)_(?P<slug>[a-z0-9-]+)_" + _TS + r"\.dump$")
+_SEQ = r"(?:-\d+)?"  # "-2", "-3"… when a name was already taken in the same minute
+_DUMP_RE = re.compile(r"^(?P<db>.+)_(?P<slug>[a-z0-9-]+)_" + _TS + _SEQ + r"\.dump$")
 
 
 @dataclass
@@ -108,6 +109,8 @@ def write_manifest(file: Path, m: Manifest) -> None:
 def read_manifest(file: Path) -> Manifest | None:
     try:
         data = json.loads(Path(file).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
         names = {f.name for f in fields(Manifest)}
         return Manifest(**{k: v for k, v in data.items() if k in names})
     except (OSError, ValueError, TypeError):
@@ -143,7 +146,7 @@ def matching_filestore(dump: Path) -> Path | None:
         if not m:
             return None
         db, slug = m.group("db"), m.group("slug")
-    pat = re.compile("^filestore_%s_%s_%s\\.tar(\\.gz)?$" % (re.escape(db), re.escape(slug), _TS))
+    pat = re.compile("^filestore_%s_%s_%s%s\\.tar(\\.gz)?$" % (re.escape(db), re.escape(slug), _TS, _SEQ))
     best, best_key = None, None
     for p in dump.parent.iterdir():
         m = pat.match(p.name)

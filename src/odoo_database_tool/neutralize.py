@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .jobs import JobContext, JobError, last_line, open_tunnel, register_secrets
+from .jobs import (JobContext, JobError, last_line, open_tunnel, register_secrets,
+                   require_expected_hostname)
 from .models import validate_identifier
 from .runner import run_capture, run_stream
 from .ssh import Tunnel
@@ -29,6 +30,7 @@ class NeutralizeResult:
     series: Optional[str]
     files: list = field(default_factory=list)
     reason: str = ""
+    missing: list = field(default_factory=list)  # installed modules with no folder in the set
 
 
 def odoo_series(latest_version: Optional[str]) -> Optional[str]:
@@ -52,6 +54,20 @@ def neutralize_sql_files(modules: list, dirs: list) -> list:
     return found
 
 
+def missing_modules(modules: list, dirs: list) -> list:
+    """Valid module names whose folder is in none of dirs (sorted); they cannot be neutralized."""
+    missing = []
+    for module in sorted(set(modules)):
+        try:
+            validate_identifier(module, "module name")
+        except ValueError:
+            continue
+        if not any((Path(d).expanduser() / sub / module).is_dir()
+                   for d in dirs for sub in _SUBDIRS):
+            missing.append(module)
+    return missing
+
+
 def _find_module_file(module: str, dirs: list) -> Optional[Path]:
     for d in dirs:
         root = Path(d).expanduser()
@@ -67,6 +83,7 @@ def neutralize(builder, target, db: str, addons_sets: dict, ctx: JobContext, run
     """Run the installed modules' neutralize.sql on db; every failure is reported as ok=False."""
     register_secrets(ctx.redactor, builder.secrets, target)
     try:
+        require_expected_hostname(builder, target, capture, ctx.redactor)
         with ExitStack() as stack:
             if pg_override is None:
                 pg_override = open_tunnel(stack, tunnel_factory, builder.ssh_bin, target)
@@ -106,6 +123,10 @@ def _neutralize(builder, target, db, addons_sets, ctx, run, capture, pg_override
     if not files or files[0].parent.parent.name != "base":
         return NeutralizeResult(False, series, files, f"base/data/neutralize.sql not found in "
                                                       f"the Odoo {series} addons set.")
+    missing = missing_modules(modules, dirs)
+    if missing:
+        ctx.log(f"Warning: modules not found in the Odoo {series} addons set (not neutralized): "
+                + ", ".join(missing))
     fd, tmp_name = tempfile.mkstemp(suffix=".sql", prefix="odt_neutralize_")
     tmp = Path(tmp_name)
     try:
@@ -124,6 +145,6 @@ def _neutralize(builder, target, db, addons_sets, ctx, run, capture, pg_override
             pass
     if not res.ok:
         detail = ctx.redactor(res.error or last_line(res.stderr_tail)) or f"exit {res.rc}"
-        return NeutralizeResult(False, series, files, f"Neutralize failed: {detail}")
+        return NeutralizeResult(False, series, files, f"Neutralize failed: {detail}", missing)
     ctx.log(f"Neutralized {db} with {len(files)} module file(s).")
-    return NeutralizeResult(True, series, files)
+    return NeutralizeResult(True, series, files, missing=missing)

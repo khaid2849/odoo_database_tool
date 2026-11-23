@@ -560,3 +560,31 @@ def test_test_connection_postgres_tunnel(secrets, ctx):
     job, _, _ = make_job(secrets, ctx)
     checks = by_name(job.test_connection(conn))
     assert checks["SSH tunnel"].ok is True and FakeTunnel.opened[0].closed
+
+
+# --- final review fixes ------------------------------------------------------------------
+
+def test_same_minute_dump_gets_suffix_instead_of_replacing(secrets, ctx, docker_conn, tmp_path,
+                                                          monkeypatch):
+    from datetime import datetime
+
+    class Fixed(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 23, 10, 15)
+
+    monkeypatch.setattr(dump_mod, "datetime", Fixed)
+    names = []
+    for _ in range(3):
+        job, _, _ = make_job(secrets, ctx)
+        names += [p.name for p in job.run(opts(docker_conn, tmp_path, fs=True),
+                                          confirmed_production=True).files]
+    assert names == [
+        "mydb_my-prod_20261123-1015.dump", "filestore_mydb_my-prod_20261123-1015.tar",
+        "mydb_my-prod_20261123-1015-2.dump", "filestore_mydb_my-prod_20261123-1015-2.tar",
+        "mydb_my-prod_20261123-1015-3.dump", "filestore_mydb_my-prod_20261123-1015-3.tar",
+    ]
+    for name in names:
+        assert (tmp_path / name).is_file() and (tmp_path / (name + ".json")).is_file()
+    sums = (tmp_path / "SHA256SUMS").read_text().splitlines()
+    assert [line.split("  ")[1] for line in sums] == names

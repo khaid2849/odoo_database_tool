@@ -240,3 +240,18 @@ def test_tar_cancel_removes_partial(tmp_path):
     with pytest.raises(InterruptedError):
         fs.tar_directory(root, "mydb", out, False, cancel=tok)
     assert not out.exists()
+
+
+def test_tar_symlinked_db_folder_extracts(tmp_path):
+    real = make_store(tmp_path / "elsewhere", "mydb")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "mydb").symlink_to(real, target_is_directory=True)
+    out = tmp_path / "o.tar"
+    assert fs.tar_directory(root, "mydb", out, False) == 3
+    with tarfile.open(out) as tf:
+        top = tf.getmember("mydb")
+        assert top.isdir() and not top.issym()
+    dest = tmp_path / "dest"
+    assert fs.extract_tar_strip(out, dest) == 3
+    assert (dest / "ff" / "f2").read_bytes() == b"world!!"

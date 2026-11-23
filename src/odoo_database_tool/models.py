@@ -114,14 +114,17 @@ class Connection:
         return ""
 
 
+def is_local_host(host: str) -> bool:
+    """Loopback name, empty (libpq default socket) or a socket directory."""
+    host = (host or "").strip()
+    return host in _LOCAL_HOSTS or host.startswith("/")
+
+
 def is_local_target(conn: Connection) -> bool:
     """True when the Postgres server is on this machine (loopback host or socket, no tunnel)."""
-    if conn.kind == Kind.LOCAL:
-        return True
-    if conn.kind != Kind.POSTGRES or conn.tunnel is not None:
+    if conn.kind not in (Kind.LOCAL, Kind.POSTGRES) or conn.tunnel is not None:
         return False
-    host = conn.pg.host.strip() if conn.pg else ""
-    return host in _LOCAL_HOSTS or host.startswith("/")
+    return is_local_host(conn.pg.host if conn.pg else "")
 
 
 def validate_identifier(value: str, what: str) -> str:
@@ -143,6 +146,12 @@ def _check_ssh(label: str, ssh: SshTarget | None, errors: list) -> None:
         errors.append(f"{label}: enter an SSH host or alias.")
     elif not 1 <= int(ssh.port) <= 65535:
         errors.append(f"{label}: SSH port must be between 1 and 65535.")
+    if ssh is None:
+        return
+    # ssh would read a leading '-' as an option (e.g. -oProxyCommand=…)
+    for what, value in (("host", ssh.host), ("alias", ssh.alias), ("ProxyJump", ssh.proxy_jump)):
+        if value.strip().startswith("-"):
+            errors.append(f"{label}: {what} must not start with '-'.")
 
 
 def validate_connection(conn: Connection) -> list:
@@ -169,6 +178,9 @@ def validate_connection(conn: Connection) -> list:
             errors.append("Postgres port must be between 1 and 65535.")
         elif conn.kind == Kind.POSTGRES and not conn.pg.host.strip():
             errors.append("Enter the Postgres host.")
+        elif conn.kind == Kind.LOCAL and not is_local_host(conn.pg.host):
+            errors.append("Local Postgres needs localhost, 127.0.0.1, ::1 or a socket folder; "
+                          "use Direct Postgres for remote hosts.")
     for label, path in (("Odoo config path", conn.odoo_conf_path), ("Filestore root", conn.filestore_root)):
         if path and conn.kind != Kind.LOCAL:  # local paths may be Windows-style
             try:

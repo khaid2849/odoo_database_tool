@@ -129,3 +129,23 @@ def test_matching_filestore_none(tmp_path):
     dump = tmp_path / "db_c_20261123-1015.dump"
     dump.write_bytes(b"1")
     assert matching_filestore(dump) is None
+
+
+def test_manifest_non_dict_json_is_none(tmp_path):
+    for text in ("[1, 2]", '"text"', "42", "null"):
+        f = tmp_path / "m.json"
+        f.write_text(text)
+        assert read_manifest(f) is None
+
+
+def test_suffixed_names_still_newest_and_matching(tmp_path):
+    (tmp_path / "db_c_20261123-0900.dump").write_bytes(b"1")
+    later = tmp_path / "db_c_20261123-0900-2.dump"
+    later.write_bytes(b"1")
+    os.utime(later, (time.time() + 60, time.time() + 60))
+    assert newest_dump(tmp_path) == later
+    fs_later = tmp_path / "filestore_db_c_20261123-0900-2.tar"
+    fs_later.write_bytes(b"1")
+    os.utime(fs_later, (time.time() + 60, time.time() + 60))
+    (tmp_path / "filestore_db_c_20261123-0900.tar").write_bytes(b"1")
+    assert matching_filestore(later) == fs_later

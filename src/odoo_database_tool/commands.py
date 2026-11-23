@@ -72,6 +72,11 @@ class CommandBuilder:
         return self._ssh(conn, f"{self._sudo(conn)}docker inspect -f "
                                f"{_q('{{.State.Running}}')} {ctr}")
 
+    def list_containers(self, conn: Connection) -> Cmd:
+        """Names of the running containers, one per line."""
+        self._require(conn, Kind.SSH_DOCKER)
+        return self._ssh(conn, f"{self._sudo(conn)}docker ps --format {_q('{{.Names}}')}")
+
     # --- source side (where the dump runs) ---------------------------------------
 
     def psql(self, conn: Connection, db: str, sql: str, *, pg_override=None) -> Cmd:
@@ -208,8 +213,8 @@ class CommandBuilder:
         pg = conn.pg
         sudo = self._pg_sudo(conn)
         argv = [tool, "-w"]
-        # Peer auth as an OS user needs the Unix socket: drop a loopback/socket host.
-        socket = bool(sudo) and (pg.host.strip() in _LOCAL_HOSTS or pg.host.startswith("/"))
+        # Peer auth as an OS user needs the Unix socket: drop a loopback name (keep a socket dir).
+        socket = bool(sudo) and pg.host.strip() in _LOCAL_HOSTS
         if pg.host and not socket:
             argv += ["-h", pg.host]
         if not (socket and int(pg.port) == 5432):

@@ -7,10 +7,18 @@ from typing import Callable, Optional, Tuple
 
 from .models import Connection, Kind
 from .runner import CancelToken, Redactor
+from .ssh import classify_ssh_error, reason_text
 from .store import SECRET_FIELDS
 
 LIST_DATABASES_SQL = ("select datname, pg_database_size(datname) from pg_database "
                       "where not datistemplate order by 1")
+SSH_HINTS = {
+    "host_key_changed": "The SSH host key has changed. Check with the server admin before connecting.",
+    "host_key_unknown": "The SSH host key is not trusted yet. Use Test on the Connections tab to accept it.",
+    "auth_failed": "SSH authentication failed: check the key, agent or password.",
+    "unreachable": "Cannot SSH: VPN/whitelist/key?",
+    "connection_lost": "The SSH connection was lost. Check the network and retry.",
+}
 
 
 @dataclass
@@ -80,3 +88,34 @@ def open_tunnel(stack: ExitStack, tunnel_factory, ssh_bin: str,
     tunnel = stack.enter_context(tunnel_factory(
         ssh_bin, conn.tunnel, conn.id, conn.pg.host, conn.pg.port))
     return ("127.0.0.1", tunnel.local_port)
+
+
+def check_hostname(builder, conn: Connection, capture, redactor: Redactor,
+                   expected: str = "") -> Check:
+    """Run `hostname` over the connection's SSH login (or tunnel); fails on a mismatch."""
+    name = "Hostname"
+    try:
+        cmd = builder.hostname(conn)
+    except ValueError as exc:
+        return Check(name, False, str(exc))
+    rc, out, err = capture(cmd, timeout=30, redactor=redactor)
+    if rc != 0:
+        kind = classify_ssh_error(err, rc)
+        reason = reason_text(kind) if kind else (redactor(last_line(err)) or f"exit code {rc}")
+        return Check(name, False, f"Cannot run hostname: {reason}",
+                     SSH_HINTS.get(kind or "", "Check the SSH settings of this connection."))
+    actual = out.strip()
+    if expected and actual != expected:
+        return Check(name, False, f"The machine is '{actual}', expected '{expected}'.",
+                     "Wrong machine? Check the SSH host/alias and the expected hostname.")
+    return Check(name, True, actual)
+
+
+def require_expected_hostname(builder, conn: Connection, capture, redactor: Redactor) -> None:
+    """Raise JobError unless the SSH machine is the expected one (no-op when none is set)."""
+    guard = conn.ssh or conn.tunnel
+    if guard is None or not guard.expected_hostname:
+        return
+    check = check_hostname(builder, conn, capture, redactor, guard.expected_hostname)
+    if not check.ok:
+        raise JobError(f"{check.detail} {check.hint}".strip())
