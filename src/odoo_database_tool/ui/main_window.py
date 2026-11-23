@@ -4,9 +4,7 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (
-    QApplication, QLabel, QMainWindow, QSplitter, QTabWidget, QVBoxLayout, QWidget,
-)
+from PySide6.QtWidgets import QApplication, QMainWindow, QSplitter, QTabWidget, QWidget
 
 from ..commands import CommandBuilder
 from ..common import APP_NAME
@@ -18,6 +16,7 @@ from ..tools import detect_ssh
 from .connections_tab import ConnectionsTab
 from .dump_tab import DumpTab
 from .log_panel import LogPanel
+from .restore_tab import RestoreTab
 from .settings_tab import SettingsTab
 from .worker import Worker
 
@@ -25,15 +24,6 @@ from .worker import Worker
 def apply_app_theme(mode: str) -> None:
     """Apply palette and stylesheet for a theme mode to the running app."""
     QApplication.instance().setStyleSheet(stylesheet(apply_theme(mode)))
-
-
-def _placeholder(text: str) -> QWidget:
-    page = QWidget()
-    layout = QVBoxLayout(page)
-    label = QLabel(text)
-    label.setAlignment(Qt.AlignCenter)
-    layout.addWidget(label)
-    return page
 
 
 class MainWindow(QMainWindow):
@@ -73,14 +63,15 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         self.setCentralWidget(splitter)
 
-    # --- tab factories (replaced by the Dump / Restore / Connections tasks) ------------
+    # --- tab factories ---------------------------------------------------------------
 
     def _make_dump_tab(self) -> QWidget:
         self.dump_tab = DumpTab(self.store, self)
         return self.dump_tab
 
     def _make_restore_tab(self) -> QWidget:
-        return _placeholder("Restore")
+        self.restore_tab = RestoreTab(self.store, self)
+        return self.restore_tab
 
     def _make_connections_tab(self) -> QWidget:
         self.connections_tab = ConnectionsTab(self.store, self.secrets, self)
