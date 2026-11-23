@@ -15,16 +15,14 @@ from typing import NoReturn, Optional, Tuple
 from . import filestore
 from .archive import (Manifest, append_sha256sums, dump_filename, filestore_filename,
                       parse_toc, sha256_file, write_manifest)
-from .jobs import Check, JobContext, JobError, human_bytes
+from .jobs import (LIST_DATABASES_SQL, Check, JobContext, JobError, human_bytes, last_line,
+                   open_tunnel, parse_database_sizes, register_secrets)
 from .models import Connection, Kind, validate_identifier
 from .runner import RunResult, run_capture, run_stream
 from .ssh import Cmd, Tunnel, classify_ssh_error, reason_text
-from .store import SECRET_FIELDS
 from .tools import parse_pg_version, pg_major
 
 _SSH_KINDS = (Kind.SSH_DOCKER, Kind.SSH_HOST)
-_LIST_SQL = ("select datname, pg_database_size(datname) from pg_database "
-             "where not datistemplate order by 1")
 _INFO_SQL = "select current_setting('server_version'), pg_database_size(current_database())"
 _ODOO_SQL = "select latest_version from ir_module_module where name='base'"
 _SSH_HINTS = {
@@ -78,14 +76,6 @@ def _unlink(path: Path) -> None:
         pass
 
 
-def _last_line(text_or_lines) -> str:
-    lines = text_or_lines.splitlines() if isinstance(text_or_lines, str) else text_or_lines
-    for line in reversed(lines):
-        if line.strip():
-            return line.strip()[:300]
-    return ""
-
-
 def _existing_parent(path: Path) -> Path:
     path = Path(path).expanduser()
     while not path.exists() and path != path.parent:
@@ -133,18 +123,13 @@ class DumpJob:
         with ExitStack() as stack:
             try:
                 override = self._open_tunnel(stack, conn)
-                cmd = self.builder.psql(conn, "postgres", _LIST_SQL, pg_override=override)
+                cmd = self.builder.psql(conn, "postgres", LIST_DATABASES_SQL, pg_override=override)
             except (RuntimeError, OSError, ValueError) as exc:
                 raise JobError(self._red(str(exc))) from None
             rc, out, err = self._capture_cmd(cmd)
         if rc != 0:
             raise JobError(f"Cannot list databases: {self._failure(conn, rc, err)}.")
-        rows = []
-        for line in out.splitlines():
-            name, sep, size = line.strip().rpartition("|")
-            if sep and name and size.isdigit():
-                rows.append((name, int(size)))
-        return rows
+        return parse_database_sizes(out)
 
     def preflight(self, opts: DumpOptions) -> list[Check]:
         """Run the checks; failures come back as Check(ok=False), never as exceptions."""
@@ -414,7 +399,7 @@ class DumpJob:
         rc, text, err = self._capture_cmd(Cmd([info.path, "-l", str(part)]), timeout=600)
         if rc != 0:
             self._reject(part, log, tail + err.splitlines(),
-                         f"pg_restore cannot read the dump: {_last_line(err) or f'exit {rc}'}.")
+                         f"pg_restore cannot read the dump: {last_line(err) or f'exit {rc}'}.")
         toc = parse_toc(text)
         self.ctx.log(f"TOC entries: {toc.entries}, TABLE DATA: {toc.table_data}")
         if toc.table_data == 0:
@@ -525,7 +510,7 @@ class DumpJob:
             if kind in (None, "connection_lost"):
                 return f"Connection lost during {what} (ssh exit 255)."
             return f"SSH failed during {what}: {reason_text(kind)}."
-        last = self._red(_last_line(res.stderr_tail))
+        last = self._red(last_line(res.stderr_tail))
         return f"{what} failed (exit {res.rc})" + (f": {last}." if last else ".")
 
     def _seal(self, out: Path, opts: DumpOptions, facts: _Facts, kind: str,
@@ -565,16 +550,11 @@ class DumpJob:
         if conn.id in self._registered:
             return
         self._registered.add(conn.id)
-        for name in SECRET_FIELDS:
-            self.ctx.redactor.add(self.builder.secrets.get(conn.id, name))
+        register_secrets(self.ctx.redactor, self.builder.secrets, conn)
 
     def _open_tunnel(self, stack: ExitStack, conn: Connection) -> Optional[Tuple[str, int]]:
         """Open the SSH tunnel of a direct-Postgres connection; returns the pg_override."""
-        if conn.kind != Kind.POSTGRES or conn.tunnel is None:
-            return None
-        tunnel = stack.enter_context(self._tunnel_factory(
-            self.builder.ssh_bin, conn.tunnel, conn.id, conn.pg.host, conn.pg.port))
-        return ("127.0.0.1", tunnel.local_port)
+        return open_tunnel(stack, self._tunnel_factory, self.builder.ssh_bin, conn)
 
     def _capture_cmd(self, cmd: Cmd, timeout: float = 60) -> tuple[int, str, str]:
         return self._capture(cmd, timeout=timeout, redactor=self.ctx.redactor)
@@ -586,7 +566,7 @@ class DumpJob:
         kind = classify_ssh_error(err, rc) if ssh or conn.kind in _SSH_KINDS else None
         if kind:
             return reason_text(kind)
-        return self._red(_last_line(err)) or f"exit code {rc}"
+        return self._red(last_line(err)) or f"exit code {rc}"
 
     @staticmethod
     def _hint(conn: Connection, rc: int, err: str, default: str, ssh: bool = False) -> str:
