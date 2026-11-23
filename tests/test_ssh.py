@@ -26,10 +26,10 @@ def test_ssh_argv_alias_batchmode():
 
 
 def test_ssh_argv_explicit_fields():
-    a = ssh_argv("ssh", SshTarget(host="10.0.0.5", port=234, user="deploy",
+    a = ssh_argv("ssh", SshTarget(host="10.0.0.5", port=234, user="admin99",
                                   identity_file="/k", proxy_jump="j@h:234"), extra=["-N"])
     assert a[-1] == "10.0.0.5" and a[a.index("-p") + 1] == "234"
-    assert a[a.index("-l") + 1] == "deploy" and a[a.index("-i") + 1] == "/k"
+    assert a[a.index("-l") + 1] == "admin99" and a[a.index("-i") + 1] == "/k"
     assert a[a.index("-J") + 1] == "j@h:234" and a[-2] == "-N"
 
 

@@ -1,6 +1,6 @@
 name: Test & Build
 
-# Push / PR: run the tests on all 3 operating systems.
+# Push / PR: run the tests on all 3 operating systems, plus integration tests on a real PostgreSQL.
 # Push a v* tag (e.g. v1.0.0): test, package the app for all 3 and publish a GitHub Release.
 on:
   push:
@@ -27,9 +27,38 @@ jobs:
       - run: python -m pip install ".[dev]"
       - run: python -m pytest -v
 
+  integration:
+    # Real PostgreSQL 14 (matches the runner's preinstalled client tools).
+    runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ODT_TEST_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Qt system libraries (Linux)
+        run: sudo apt-get update && sudo apt-get install -y libxcb-cursor0 libegl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+      - run: pg_dump --version
+      - run: python -m pip install ".[dev]"
+      - run: python -m pytest -m integration -v
+
   build:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    needs: test
+    needs: [test, integration]
     strategy:
       fail-fast: false
       matrix:

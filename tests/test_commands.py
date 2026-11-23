@@ -34,7 +34,7 @@ def builder(secrets):
 def docker_conn():
     c = Connection.new("staging", Kind.SSH_DOCKER)
     c.ssh.alias = "my-server"
-    c.container = "odoo-web-1"
+    c.container = "my-erp-odoo-1"
     return c
 
 
@@ -138,7 +138,7 @@ def test_docker_odoo_conf_leaves_host_to_socket(builder, docker_conn):
 
 def test_docker_db_and_sql_are_positional_args(builder, docker_conn):
     r = builder.psql(docker_conn, "odoo_dev", "select 'a'").argv[-1]
-    assert r.startswith("docker exec -e LC_ALL=C odoo-web-1 sh -c ")
+    assert r.startswith("docker exec -e LC_ALL=C my-erp-odoo-1 sh -c ")
     assert r.endswith(" sh odoo_dev " + shlex.quote("select 'a'"))
     assert "-Atc" in r and "-X" in r and "-w" in r and '"$1"' in r and '"$2"' in r
 
@@ -152,12 +152,12 @@ def test_docker_use_sudo_prefixes_docker(builder, docker_conn):
     docker_conn.ssh.use_sudo = True
     assert builder.dump_db(docker_conn, "db1").argv[-1].startswith("sudo -n docker exec -e LC_ALL=C ")
     assert builder.container_running(docker_conn).argv[-1] == \
-        "sudo -n docker inspect -f '{{.State.Running}}' odoo-web-1"
+        "sudo -n docker inspect -f '{{.State.Running}}' my-erp-odoo-1"
 
 
 def test_container_running_without_sudo(builder, docker_conn):
     c = builder.container_running(docker_conn)
-    assert c.argv[-1] == "docker inspect -f '{{.State.Running}}' odoo-web-1"
+    assert c.argv[-1] == "docker inspect -f '{{.State.Running}}' my-erp-odoo-1"
     assert c.argv[-2] == "my-server"
 
 
@@ -184,7 +184,7 @@ def test_rejects_bad_odoo_conf_path(builder, docker_conn):
 
 def test_docker_pg_dump_version(builder, docker_conn):
     assert builder.pg_dump_version(docker_conn).argv[-1] == \
-        "docker exec -e LC_ALL=C odoo-web-1 pg_dump --version"
+        "docker exec -e LC_ALL=C my-erp-odoo-1 pg_dump --version"
 
 
 def test_ssh_host_quotes_pg_values(builder, host_conn):
@@ -242,7 +242,7 @@ def test_ssh_host_pg_dump_version_uses_os_user(builder, host_conn):
 
 def test_filestore_stats_docker(builder, docker_conn):
     r = builder.filestore_stats(docker_conn, "db1").argv[-1]
-    assert r.startswith("docker exec -e LC_ALL=C odoo-web-1 sh -c ")
+    assert r.startswith("docker exec -e LC_ALL=C my-erp-odoo-1 sh -c ")
     assert r.endswith(" sh /var/lib/odoo/filestore db1") and "du -sk" in r and "wc -l" in r
 
 
@@ -254,7 +254,7 @@ def test_filestore_stats_ssh_host_sudo_quotes_root(builder, host_conn):
 
 def test_filestore_tar_docker_and_gzip(builder, docker_conn):
     assert builder.filestore_tar(docker_conn, "db1", False).argv[-1] == \
-        "docker exec -e LC_ALL=C odoo-web-1 nice -n 10 tar cf - -C /var/lib/odoo/filestore db1"
+        "docker exec -e LC_ALL=C my-erp-odoo-1 nice -n 10 tar cf - -C /var/lib/odoo/filestore db1"
     assert " tar czf - " in builder.filestore_tar(docker_conn, "db1", True).argv[-1]
 
 

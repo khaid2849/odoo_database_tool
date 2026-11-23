@@ -85,14 +85,14 @@ def test_target_and_safety(tmp_path):
 @pytest.mark.parametrize("name,mode", [("a.tar", "w"), ("a.tar.gz", "w:gz"), ("a.tgz", "w:gz")])
 def test_extract_strips_top(tmp_path, name, mode):
     a = tmp_path / name
-    make_tar(a, [("odoo", None), ("odoo/0a", None), ("odoo/0a/f1", b"abc"), ("odoo/ff/f2", b"zz")], mode)
+    make_tar(a, [("odoo_src", None), ("odoo_src/0a", None), ("odoo_src/0a/f1", b"abc"), ("odoo_src/ff/f2", b"zz")], mode)
     dest = tmp_path / "dest"
     seen = []
     n = fs.extract_tar_strip(a, dest, on_file=seen.append)
     assert n == 2 and seen == [1, 2]
     assert (dest / "0a" / "f1").read_bytes() == b"abc"
     assert (dest / "ff" / "f2").read_bytes() == b"zz"
-    assert not (dest / "odoo").exists()
+    assert not (dest / "odoo_src").exists()
     assert (dest / "0a" / "f1").stat().st_mode & 0o777 == 0o644
 
 

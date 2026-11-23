@@ -162,8 +162,8 @@ def reset_tunnels():
 
 @pytest.fixture
 def docker_conn():
-    c = Connection.new("Prod Server", Kind.SSH_DOCKER)
-    c.ssh.alias = "prod-server"
+    c = Connection.new("My Prod", Kind.SSH_DOCKER)
+    c.ssh.alias = "my-prod"
     c.ssh.expected_hostname = "vm-prod-001"
     c.container = "odoo-1"
     return c
@@ -293,12 +293,12 @@ def test_dump_success_writes_file_sums_manifest(secrets, ctx, docker_conn, tmp_p
     assert len(result.files) == 1
     out = result.files[0]
     assert out.exists() and out.parent == dest
-    assert out.name.startswith("mydb_prod-server_") and out.name.endswith(".dump")
+    assert out.name.startswith("mydb_my-prod_") and out.name.endswith(".dump")
     assert not list(dest.glob("*.part")) and not list(dest.glob("*.log"))
     assert (dest / "SHA256SUMS").read_text() == f"{sha256_file(out)}  {out.name}\n"
     man = json.loads((dest / (out.name + ".json")).read_text())
     assert man["kind"] == "db"
-    assert man["connection"] == "Prod Server" and man["connection_kind"] == "ssh_docker"
+    assert man["connection"] == "My Prod" and man["connection_kind"] == "ssh_docker"
     assert man["server_version"] == "17.12" and man["pg_dump_version"] == "17.2"
     assert man["odoo_version"] == "18.0.1.3"
     assert man["size"] == len(DUMP_BYTES) and man["sha256"] == sha256_file(out)
@@ -400,7 +400,7 @@ def test_filestore_tar_rc1_is_warning(secrets, ctx, docker_conn, tmp_path):
     job, _, _ = make_job(secrets, ctx, run=run)
     result = job.run(opts(docker_conn, tmp_path, db=False, fs=True))
     out = result.files[0]
-    assert out.name.startswith("filestore_mydb_prod-server_") and out.name.endswith(".tar")
+    assert out.name.startswith("filestore_mydb_my-prod_") and out.name.endswith(".tar")
     assert out.exists() and not list(tmp_path.glob("*.part"))
     assert any("changed" in w for w in result.warnings)
     man = json.loads((tmp_path / (out.name + ".json")).read_text())

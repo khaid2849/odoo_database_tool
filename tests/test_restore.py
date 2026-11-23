@@ -164,7 +164,7 @@ def remote_conn():
 def dump_file(tmp_path):
     folder = tmp_path / "Odoo DB Dumps"
     folder.mkdir()
-    p = folder / "mydb_prod-server_20261123-1000.dump"
+    p = folder / "mydb_my-prod_20261123-1000.dump"
     p.write_bytes(DUMP_BYTES)
     return p
 
@@ -226,14 +226,14 @@ def test_inspect_dump_sha_mismatch(dump_file):
 def test_inspect_dump_ok_with_sum_and_manifest(dump_file):
     append_sha256sums(dump_file.parent, dump_file.name, sha256_file(dump_file))
     write_manifest(dump_file.with_name(dump_file.name + ".json"), Manifest(
-        kind="db", connection="Prod Server", connection_kind="ssh_docker", database="mydb",
+        kind="db", connection="My Prod", connection_kind="ssh_docker", database="mydb",
         created_at="2026-11-23T10:00:00+07:00", size=len(DUMP_BYTES), sha256="x"))
     cap = FakeCapture([])
     info = inspect_dump(dump_file, PG_RESTORE, capture=cap)
     assert info.path == dump_file and info.size == len(DUMP_BYTES)
     assert info.sha_status == "ok"
     assert info.toc.table_data == 2 and info.toc.extensions == ["vector"]
-    assert info.manifest is not None and info.manifest.connection == "Prod Server"
+    assert info.manifest is not None and info.manifest.connection == "My Prod"
     assert cap.calls == [f"/pg/bin/pg_restore -l {dump_file}"]
 
 
@@ -267,7 +267,7 @@ def test_execute_refuses_production_target(secrets, ctx, local_conn, dump_file):
 
 
 def test_execute_refuses_ssh_kind(secrets, ctx, dump_file):
-    conn = Connection.new("Prod Server", Kind.SSH_DOCKER)
+    conn = Connection.new("My Prod", Kind.SSH_DOCKER)
     job, _, _, events = make_job(secrets, ctx)
     with pytest.raises(JobError, match="Direct or Local Postgres"):
         job.execute(make_plan(dump_file, conn))
@@ -483,14 +483,14 @@ def test_filestore_extracted_into_target_db_folder(secrets, ctx, local_conn, dum
     target = root / "odoo_prod"
     (target / "ab").mkdir(parents=True)
     (target / "ab" / "stale").write_bytes(b"old")
-    src = make_tar(tmp_path / "filestore_odoo.tar", "odoo_staging", ["0a/f1", "0a/f2", "ff/f3"])
+    src = make_tar(tmp_path / "filestore_odoo_src.tar", "odoo_src", ["0a/f1", "0a/f2", "ff/f3"])
     job, _, _, _ = make_job(secrets, ctx)
     outcome = job.execute(make_plan(dump_file, local_conn, db="odoo_prod",
                                     fs_src=src, fs_root=root))
     assert outcome.status == "ok"
     assert (target / "0a" / "f1").read_bytes() == b"data"
     assert not (target / "ab").exists()
-    assert not (root / "odoo_staging").exists()
+    assert not (root / "odoo_src").exists()
     assert outcome.filestore_files == 3
 
 
